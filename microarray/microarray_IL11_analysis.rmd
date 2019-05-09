@@ -1,0 +1,1120 @@
+---
+title: "Human lung IPF microarray analysis"
+author: Giuseppe D'Agostino
+date: "`r format(Sys.time(), '%d %B, %Y')`" 
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        theme: 'cosmo'
+        highlight: 'tango'
+        code_folding: hide
+        df_print: paged
+---
+
+# Raw data preprocessing
+
+Raw data downloaded from GEO series GSE47460 is preprocessed in bash using a set of commands found on this <a href='https://gist.github.com/brentp/1152860' target='_blank'>git</a>. 
+
+
+```{bash, preprocessing, eval = FALSE}
+# This first part is in shell and requires to unzip the raw data TAR and then gunzip all the files contained in the tar
+
+for i in *txt; do mv "$i"  `echo $i | sed -E s/'GSM[0-9]+_'/''/g`; done
+
+for f in data/LT*.txt; do 
+    rm -f a.tmp
+     awk 'BEGIN { seen=0;FS=OFS="\t" }
+         { if($1=="FEATURES"){ seen=1 }
+         if(seen==1){ print $0; }}' $f > a.tmp
+     nlines=$(wc -l "a.tmp" | awk '{ print $1 }')
+     n=$(($nlines - 1))
+     mv a.tmp data/scrubbed/`basename $f .txt`.${n}.txt
+   echo $f $n
+ done
+
+
+#for each chip used, create a target file.
+ 
+ printf "FileName\tCondition\n" > data/scrubbed/Targets_45015.txt
+ paste <(ls data/scrubbed/*.45015*) <(ls data/scrubbed/*.45015* | sed -E s#'^data/scrubbed/LT[A-Z0-9]+_'#''#g | sed s/.45015.txt//g) >> data/scrubbed/Targets_45015.txt
+ printf "FileName\tCondition\n" > data/scrubbed/Targets_62976.txt
+ paste <(ls data/scrubbed/*.62976*) <(ls data/scrubbed/*.62976* | sed -E s#'^data/scrubbed/LT[A-Z0-9]+_'#''#g | sed s/.62976.txt//g) >> data/scrubbed/Targets_62976.txt
+
+#make directories to save plots and tables
+
+ mkdir Lung_Function_Correlations
+ 	mkdir Lung_Function_Correlations/predicted_dlco
+ 	mkdir Lung_Function_Correlations/predicted_fev1_postbd
+ 	mkdir Lung_Function_Correlations/predicted_fev1_prebd
+ 	mkdir Lung_Function_Correlations/predicted_fvc_postbd
+ 	mkdir Lung_Function_Correlations/predicted_fvc_prebd
+
+ mkdir Fibrosis_Genes_Correlations
+ 	mkdir Fibrosis_Genes_Correlations/FN1
+ 	mkdir Fibrosis_Genes_Correlations/ACTA2
+ 	mkdir Fibrosis_Genes_Correlations/COL3A1
+ 	mkdir Fibrosis_Genes_Correlations/COL1A1
+ 	mkdir Fibrosis_Genes_Correlations/COL1A2
+ 	mkdir Fibrosis_Genes_Correlations/TIMP1
+ 	mkdir Fibrosis_Genes_Correlations/MMP2
+ 	mkdir Fibrosis_Genes_Correlations/MMP9
+
+
+```
+
+# Libraries and functions
+
+```{r, echo = TRUE, results = "hide"}
+libs = c("limma", "RVAideMemoire", "pspearman", "tidyverse", "openxlsx", "biomaRt", "beeswarm", "nortest", "gplots", "pheatmap", "viridis", "robust")
+suppressMessages({lapply(libs, require, character.only = T)})
+source("helper_functions.R")
+```
+
+# Targets and metadata
+
+We read the `targets.txt` file that was created earlier in bash. We then create a metadata table in the `targets` dataframe in which more information is stored.
+
+```{r, include = FALSE}
+## Loop to avoid reprocessing computationally intensive steps
+doit <- !file.exists("Microarray_Analysis_Final.RData")
+if(!doit) load("Microarray_Analysis_Final.RData")
+	
+	if(exists("dotwo"))
+	{
+		if(doit & dotwo) dotwo = TRUE else dotwo = FALSE
+	} else dotwo = TRUE
+	
+	if(exists("dothree"))
+	{
+		if(doit & dothree) dothree = TRUE else dothree = FALSE
+	} else dothree = 
+
+	if(exists("dofour"))
+	{
+		if(doit & dofour) dofour = TRUE else dofour = FALSE
+	} else dofour = TRUE
+
+	if(exists("dofive"))
+	{
+		if(doit & dofive) dofive = TRUE else dofive = FALSE
+	} else dofive = TRUE
+```
+
+```{r, load_targets, eval = dotwo}
+
+## Set chunk as not yet done
+dotwo = TRUE
+
+## Load human ensembl biomart 
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = "www.ensembl.org", ensemblRedirect = FALSE)
+
+## Load conversion table
+bm <- getBM(attributes=c("ensembl_gene_id", "refseq_mrna", "hgnc_symbol" ), mart=mart) %>%
+  distinct() %>% 
+  as_tibble() %>%
+  na_if("") %>% 
+  na.omit()
+bm = as.data.frame(bm)
+
+## Load microarray targets 
+GROUP="62976"
+targets = readTargets(paste("data/scrubbed/Targets_", GROUP, ".txt", sep=""))
+targets$Title = as.character(sapply(targets$FileName, function(x) gsub(x, pattern = "data/scrubbed/", replacement = "", fixed = T)))
+targets$Title = as.character(sapply(targets$Title, function(x) gsub(x, pattern = ".62976.txt", replacement = "", fixed = T)))
+
+## Read demographics table taken from NCBI
+messy <- read.xlsx("pdata.xlsx", fillMergedCells = TRUE)
+
+## Create a column for each characteristic
+tidyup <- messy %>% 
+			separate(Characteristics, into = c("variable", "value"), sep = ": ") %>% 
+			spread(variable, value) 
+
+colnames(tidyup)[9:15] = c("emphysema_f950", "predicted_dlco", "predicted_fev1_postbd", "predicted_fev1_prebd", "predicted_fvc_postbd", "predicted_fvc_prebd", "smoker")
+tidyup[,16] <- NULL
+targets = as.data.frame(cbind(targets, tidyup))
+targets[is.na(targets$Ild.subtype),'Ild.subtype'] = 'CTRL'
+
+## Set chunk as done
+dotwo = FALSE
+```
+
+
+**Subsetting by condition: CTRL and IPF only**
+
+We only take microarrays from the ILD (Interstitial Lung Disease) condition, with subtype "UIP/IPF". We read the Agilent array images, correct the background, normalize using quantile normalization, then log-transform the data. Replicates are averaged.
+
+```{r, subset_microarray}
+## Subset for CTRL and Interstitial Lung Disease patients
+targets_2 = targets[ targets$Condition %in% c("CTRL", "ILD"),]
+
+## Subset for CTRL and IPF
+targets_2 = targets_2[ targets_2$Ild.subtype %in% c("CTRL", "2-UIP/IPF"),]
+```
+
+```{r, load_microarray_normalize, eval = dothree}
+## Set chunk as not yet done
+dothree = TRUE
+
+## Read all agilent microarray files
+dat3 = read.maimages(files=targets_2$FileName, path=".", source="agilent.median", green.only=T,
+    columns=list(G="gMedianSignal", Gb="gBGMedianSignal"), 
+    annotation=c("Row", "Col", "ProbeName", "SystematicName")
+)
+
+## Background correction
+dat3 <- backgroundCorrect(dat3, method="normexp", offset=1)
+
+## Normalization
+dat3$E <- normalizeBetweenArrays(dat3$E, method="quantile")
+
+## Log-transformation
+dat3$E <- log2(dat3$E)
+ #very important: E and M are identical for a 1 color array
+E3 = new("MAList", list(targets=dat3$targets, genes=dat3$genes, source=dat3$source, M=dat3$E, A=dat3$E))
+
+## Average replicates
+E3.avg <- avereps(E3, ID=E3$genes$SystematicName)
+
+# make the design matrix
+colnames(E3.avg$A) = paste(colnames(E3.avg$A), "txt", sep = '.')
+
+## Set chunk as done
+dothree = FALSE
+```
+
+# limma differential expression analysis
+
+A linear model is fit, correcting for age and sex. Then the empirical Bayes shrinkage is applied. We then visualize the results for IL11.
+
+```{r, limma_analysis}
+## Limma analysis: set factors, levels and model matrix 
+d3.levels = unique(targets_2$Condition)
+d3.factor = factor(targets_2$Condition, levels=d3.levels)
+d3.factor = relevel(d3.factor, "CTRL")
+d3.age = as.numeric(targets_2$Age)
+
+d3.sex = factor(targets_2$Sex, levels = unique(targets_2$Sex))
+d3.sex = gsub(d3.sex, pattern = "1-Male", replacement = "Male")
+d3.sex = gsub(d3.sex, pattern = "2-Female", replacement = "Female")
+d3.sex = factor(d3.sex)
+
+
+
+d3.design = model.matrix(~ 0 + d3.factor + d3.age + d3.sex)
+
+## Fit the linear model
+fit.3 = lmFit(E3.avg$A, d3.design)
+
+## Contrast between IPF and CTRL
+contrast.matrix3 <- makeContrasts("d3.factorILD-d3.factorCTRL", levels=d3.design)
+fit.3 <- contrasts.fit(fit.3, contrast.matrix3)
+
+## Apply empirical Bayes shrinkage
+fit.3.2 <- eBayes(fit.3)
+
+## Adjust p-values and sort
+tt_ILD_3 = topTable(fit.3.2, adjust = 'fdr', coef = 1, genelist = E3.avg$genes, number = Inf)
+
+## Results for IL11
+tt_ILD_3[tt_ILD_3$SystematicName == 'NM_000641',]
+
+## Plot log-normalized average IL11 expression in CTRL and IPF
+beeswarm(E3.avg$A['NM_000641',targets_2$FileName] ~ targets_2$Condition, method = 'hex', pch = 21, col = c("purple", "salmon"), cex = 0.6, bg = 'white', ylim = c(0,12), ylab = 'log(IL11 average expression)', xlab = 'Condition', main = 'IL11 expression - lung microarray')
+boxplot(E3.avg$A['NM_000641',targets_2$FileName] ~ targets_2$Condition, ylim = c(0,11), col = NA, border = 'black', lwd = 1, pch = 21, bg = 'white', xaxt = 'n', yaxt = 'n', outline = F, boxwex = 0.5, add = T)
+segments(x0 = 1, x1 = 2, y0 = max(E3.avg$A['NM_000641',targets_2$FileName])+1, y1 = max(E3.avg$A['NM_000641',targets_2$FileName])+1)
+	text(x = 1.5, y = max(E3.avg$A['NM_000641',targets_2$FileName])+1.5, labels = paste("FDR = ",formatC(tt_ILD_3[tt_ILD_3$SystematicName == 'NM_000641',9], format = 'e', digits = 3)))
+
+```
+
+IL11 is significantly up-regulated in IPF lung tissue compared to healthy controls, controlling for age and sex.
+
+# Smoker status
+
+Smoker information is present only in a subset of samples. We subset the targets and run the same analysis:
+
+```{r}
+
+targets_smoker <- targets_2[!is.na(targets_2$smoker),]
+
+
+d4.levels = unique(targets_smoker$Condition)
+d4.factor = factor(targets_smoker$Condition, levels=d4.levels)
+d4.factor = relevel(d4.factor, "CTRL")
+d4.age = as.numeric(targets_smoker$Age)
+
+d4.sex = factor(targets_smoker$Sex, levels = unique(targets_smoker$Sex))
+d4.sex = gsub(d4.sex, pattern = "1-Male", replacement = "Male")
+d4.sex = gsub(d4.sex, pattern = "2-Female", replacement = "Female")
+d4.sex = factor(d4.sex)
+
+
+d4.smoker = as.character(factor(targets_smoker$smoker, levels = unique(targets_smoker$smoker)))
+d4.smoker = gsub(d4.smoker, pattern = "1-Current", replacement = "Current")
+d4.smoker[grep(d4.smoker, pattern = "^2")] =  "Ever"
+d4.smoker = gsub(d4.smoker, pattern = "3-Never", replacement = "Never")
+d4.smoker = factor(d4.smoker)
+d4.smoker = relevel(d4.smoker, "Never")
+
+d4.design = model.matrix(~ 0 + d4.factor + d4.age + d4.sex + d4.smoker)
+
+## Fit the linear model
+fit.4 = lmFit(E3.avg$A[,targets_smoker$FileName], d4.design)
+
+## Contrast between IPF and CTRL
+contrast.matrix4 <- makeContrasts("d4.factorILD-d4.factorCTRL", levels=d4.design)
+fit.4 <- contrasts.fit(fit.4, contrast.matrix4)
+
+## Apply empirical Bayes shrinkage
+fit.4.2 <- eBayes(fit.4)
+
+## Adjust p-values and sort
+tt_ILD_4 = topTable(fit.4.2, adjust = 'fdr', coef = 1, genelist = E3.avg$genes, number = Inf)
+
+## Results for IL11
+tt_ILD_4[tt_ILD_4$SystematicName == 'NM_000641',]
+
+```
+Even when accounting for smoker status, IL11 is still significantly up-regulated in IPF.
+
+# Lung function
+
+As a sanity check, we visualize and test for differences in 5 different lung function measurements between control an IPF. We first want to know whether we should run a t-test or a non-parametric test between CTRL and IPF lung-function values. We will perform 2 normality tests (Anderson-Darling (AD) and Wilkes-Shapiro (WS)). Both these tests assume as null hypothesis that the distribution from which the sample is normal, so the significance is a measure of the departure from normality (also visible in a QQ plot). As a caveat we must remember that these tests do not tell us whether the distribution is normal, just whether we can reject the null hypothesis that the sample comes from a normally distributed population. 
+
+```{r, lungfunction_normalitytest, fig.height = 7, fig.width = 9}
+
+## Plot results of normality tests and distributions
+layout(matrix(1:6, nrow = 2))
+for( i in colnames(targets_2)[13:17])
+{	
+	x = as.numeric(targets_2[!is.na(targets_2[,i]),i])
+	at = nortest::ad.test(x)
+	st = stats::shapiro.test(x)
+	qqnorm(x, main = paste(i, "values"))
+	qqline(x, col = 'red')
+	legend('topleft', bty = 'n', legend = c(paste("AD p:", formatC(at$p.value, format = "e", digits = 3)), paste("WS p:", formatC(st$p.value, format = "e", digits = 3))))
+	hist(x, breaks = 20, col = 'cadetblue', border = NA, main = paste(i, 'value distribution'))
+
+}
+```
+
+Some sets of lung function values appear to depart slightly from the normal distribution and do not allow us to confidently reject the null hp under the commonly used threshold of p < 0.05. We may then use a non-parametric test in order to gauge the differences between CTRL and IPF for every lung function. 
+
+```{r, lungfunction_NPT, fig.height = 7, fig.width = 9}
+
+## Plot lung function values and test results
+layout(matrix(1:6, nrow = 2))
+for( i in colnames(targets_2)[13:17])
+{	
+	x_ipf = as.numeric(targets_2[!is.na(targets_2[,i]) & targets_2$Ild.subtype == "2-UIP/IPF", i])
+	x_ctrl = as.numeric(targets_2[!is.na(targets_2[,i]) & targets_2$Ild.subtype == "CTRL", i])
+
+	npt = wilcox.test(x_ctrl, x_ipf)
+
+	boxplot(x_ipf, x_ctrl, border = c('salmon', 'purple'), lwd = 2, col = NA, main = paste(i, "IPF vs CTRL"), ylab = i, xaxt = 'n', ylim = c(0,max(c(x_ipf, x_ctrl)))+(max(c(x_ipf, x_ctrl))/10), outline = F)
+	beeswarm(x_ipf, method = "hex", pch = 21, col = 'black', bg = paste(col2hex('salmon'), '4D', sep = ""), add = T)
+	beeswarm(x_ctrl, at = 2, method = "hex", pch = 21, col = 'black', bg = paste(col2hex('purple'), '4D', sep = ""), add = T)
+
+	segments(x0 = 1, x1 = 2, y0 = max(c(x_ipf, x_ctrl))+(max(c(x_ipf, x_ctrl))/20), y1 = max(c(x_ipf, x_ctrl))+(max(c(x_ipf, x_ctrl))/20))
+	text(x = 1.5, y = max(c(x_ipf, x_ctrl))+(max(c(x_ipf, x_ctrl))/12), labels = formatC(npt$p.value, format = "e", digits = 3))
+	axis(1, at = 1:2, labels = c("IPF", "CTRL"))
+
+}
+```
+
+We can see how all lung functions are significantly different between healthy and IPF patients.
+
+Let's see what these look like when incorporating smoker status:
+
+```{r}
+layout(matrix(1:6, nrow = 2))
+for( i in colnames(targets_2)[13:17])
+{	
+	x_ipf = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "2-UIP/IPF", ]
+	x_ctrl = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "CTRL", ]
+
+	x_ipf[, i] <- as.numeric(x_ipf[, i])
+	x_ctrl[, i] <- as.numeric(x_ctrl[, i])
+
+	boxplot(x_ipf[,i]~factor(x_ipf$smoker, levels = unique(x_ipf$smoker)), border = "salmon", lwd = 2, xaxt = "n", col = NA, main = paste(i, "IPF vs CTRL"), ylab = i, ylim = c(-5,max(c(x_ipf[,i], x_ctrl[,i])))+(max(c(x_ipf[,i], x_ctrl[,i]))/10), outline = F, at = 1:length(unique(x_ipf$smoker)), xlim = c(0,7))
+
+	boxplot(x_ctrl[,i] ~ factor(x_ctrl$smoker, levels = unique(x_ctrl$smoker)), border = "purple", lwd = 2, col = NA, outline = F, at = (length(unique(x_ipf$smoker)) + 1) : (length(unique(x_ipf$smoker)) + length(unique(x_ctrl$smoker))), add = T, xaxt = "n")
+	
+	beeswarm(x_ipf[,i] ~ factor(x_ipf$smoker, levels = unique(x_ipf$smoker)), method = "hex", pch = 21, cex = 0.7, col = 'black', bg = paste(col2hex('salmon'), '4D', sep = ""), at = 1:length(unique(x_ipf$smoker)), xlim = c(0,7), add = T)
+
+	beeswarm(x_ctrl[,i] ~ factor(x_ctrl$smoker, levels = unique(x_ctrl$smoker)), method = "hex", pch = 21, cex = 0.7, col = 'black', bg = paste(col2hex('purple'), '4D', sep = ""), add = T, at = (length(unique(x_ipf$smoker)) + 1):(length(unique(x_ipf$smoker))+length(unique(x_ctrl$smoker))))
+
+
+	axis(1, at = 1:(length(unique(x_ipf$smoker)) + length(unique(x_ctrl$smoker))), labels = c(unique(x_ipf$smoker), unique(x_ctrl$smoker)), las = 2)
+
+}
+```
+
+
+Testing against current smokers is not possible due to lack of data points. 
+
+We show the results of Wilcoxon rank sum tests between ever- and never-smokers within patient groups, and between patient groups within smoker status:
+
+
+```{r}
+for( i in colnames(targets)[13:17])
+{	
+
+	x_ipf = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "2-UIP/IPF", ]
+	x_ctrl = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "CTRL", ]
+
+
+print(paste(i, "Ever smoker - IPF vs CTRL:"))
+print(wilcox.test( as.numeric(x_ipf[x_ipf$smoker == "2-Ever (>100)",i]), as.numeric(x_ctrl[x_ctrl$smoker == "2-Ever (>100)",i]))$p.value)
+
+print(paste(i,"Never smoker - IPF vs CTRL:"))
+print(wilcox.test(as.numeric(x_ipf[x_ipf$smoker == "3-Never",i]), as.numeric(x_ctrl[x_ctrl$smoker == "3-Never",i]))$p.value)
+}
+```
+
+All lung functions are significantly different between IPF and CTRL regardless of smoker status, although the smoker status does increase slightly the significance when the CTRL have never smoked.
+
+Now, within patient group and across smoker status:
+
+```{r}
+for( i in colnames(targets)[13:17])
+{	
+
+	x_ipf = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "2-UIP/IPF", ]
+	x_ctrl = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "CTRL", ]
+
+print(paste(i, "IPF - Ever vs Never smoker"))
+print(wilcox.test( as.numeric(x_ipf[x_ipf$smoker == "2-Ever (>100)",i]), as.numeric(x_ipf[x_ipf$smoker == "3-Never",i]))$p.value)
+
+print(paste(i,"CTRL - Ever vs Never smoker"))
+print(wilcox.test(as.numeric(x_ctrl[x_ctrl$smoker == "2-Ever (>100)",i]), as.numeric(x_ctrl[x_ctrl$smoker == "3-Never",i]))$p.value)
+}
+
+```
+
+There is never a significant difference within patient group, across smoker status, for any function.
+
+## Linear models - checking covariates
+
+We now want to know whether there is a statistically significant relationship between gene expression and age/sex, and smoker status. It can always be accounted for, but it is interesting to know how much this relationship weighs in on the rest of the analyses. Since we are mostly interested in *IL11* in IPF, we will use its expression values to perform these tests.
+We will first do it checking age and sex, and add the smoker status later on.
+
+```{r, fig.width = 8, fig.height = 8}
+
+## Define expression matrix
+targets_only_IPF = targets_2[targets_2$Condition == "ILD",]
+targets_only_IPF = targets_only_IPF[targets_only_IPF$Ild.subtype == "2-UIP/IPF",]
+cor_targets = targets_only_IPF
+Evalues = E3.avg$A[,cor_targets$FileName]
+
+
+## Get expression values for IL11
+j = "NM_000641"
+expr_values = Evalues[j,]
+
+## Get covariate levels
+age = as.numeric(cor_targets$Age)[order(expr_values)]
+sex2 = cor_targets$Sex[order(expr_values)]
+sex = factor(sex2, levels = c("1-Male", "2-Female"))
+cols = cor_targets$col_ipf[order(expr_values)]
+expr_values = expr_values[order(expr_values)]
+
+x <- expr_values
+
+## Fit different linear models
+fit1 <- lm(x ~ age)
+fit2 <- lm(x ~ sex)
+fit3 <- lm(x ~ age + sex)
+fit4 <- lm(x ~ age + sex + age*sex)
+
+
+fits <- list("expression_age" = fit1, "expression_sex" = fit2, "expression_age+sex" = fit3, "expression_age_sex_interaction" = fit4)
+
+## Get residuals and test for normality, then plot results
+for(l in 1:length(fits)){
+	rr <- residuals(fits[[l]])
+	at = nortest::ad.test(rr)
+	st = stats::shapiro.test(rr)
+
+	layout(matrix(1:4, nrow = 2))
+	qqnorm(rr, main = paste(names(fits)[l], "residuals QQ plot"))
+	qqline(rr, col = 'red')
+	legend('topleft', bty = 'n', legend = c(paste("AD p:", formatC(at$p.value, format = "e", digits = 3)), paste("WS p:", formatC(st$p.value, format = "e", digits = 3))))
+	hist(rr, breaks = 20, col = 'cadetblue', border = NA, main =  'LM residuals')
+	plot(fits[[l]]$fitted.values, rr, pch = 16, ylab = "residuals", xlab = "fitted values", main = "Residuals vs fitted values")
+			}
+```
+
+The residuals show that the data is heteroscedastic. The histogram looks normal, but if we want to be strict according to normality tests we cannot apply a linear model since the assumption of normality of residuals may be violated. We can, however, apply the Box-Cox transformation to gene expression values to make them conform more to the normal distribution, and see what happens to the standardized residuals:
+
+```{r, fig.width = 8, fig.height = 8}
+## Box-Cox transformation
+x_bc <- predict(caret::BoxCoxTrans(x),x)
+
+## Fit the Box-Cox transformed values using the interaction model
+fit5 = lm(x_bc ~ age + sex + age*sex)
+## Get standardized residuals
+
+rr = MASS::stdres(fit5)
+
+## Normality tests
+at = nortest::ad.test(rr)
+st = stats::shapiro.test(rr)
+
+## Plot results
+layout(matrix(1:4, nrow = 2))
+			qqnorm(rr, main = paste(i, "values"))
+			qqline(rr, col = 'red')
+			legend('topleft', bty = 'n', legend = c(paste("AD p:", formatC(at$p.value, format = "e", digits = 3)), paste("WS p:", formatC(st$p.value, format = "e", digits = 3))))
+			hist(rr, breaks = 20, col = 'cadetblue', border = NA, main =  'LM residuals')
+			plot(fit5$fitted.values, rr, pch = 16, ylab = "residuals", xlab = "fitted values", main = "Residuals vs fitted values")
+
+```
+
+We can now fit a linear model between Box-Cox-transformed gene expression and the two covariates, see how much they weigh in on the relationship:
+
+```{r}
+	summary(lm(x_bc ~ age))
+	summary(lm(x_bc ~ sex))
+	summary(lm(x_bc ~ age + sex))
+	summary(lm(x_bc ~ age + sex + age*sex))
+```
+There is only a slight statistically significant relationship between gene expression and age (Adjusted Rsquared 0.02842), but when considering both age and sex in combination - with and without interaction - the relationship is not significant. Importantly, this was also the case when fitting a linear model without transforming the data:
+
+```{r}
+			summary(lm(x ~ age))
+			summary(lm(x ~ sex))
+			summary(lm(x ~ age + sex))
+			summary(lm(x ~ age + sex + age*sex))
+```
+
+Adding smoker status, in IPF:
+
+```{r}
+targets_only_IPF_smoker = targets_smoker[targets_smoker$Condition == "ILD",]
+targets_only_IPF_smoker = targets_only_IPF_smoker[targets_only_IPF_smoker$Ild.subtype == "2-UIP/IPF",]
+cor_targets_smoker = targets_only_IPF_smoker
+Evalues = E3.avg$A[,cor_targets_smoker$FileName]
+
+
+## Get expression values for IL11
+j = "NM_000641"
+expr_values = Evalues[j,]
+
+## Get covariate levels
+age = as.numeric(cor_targets$Age)[order(expr_values)]
+sex2 = cor_targets$Sex[order(expr_values)]
+sex = factor(sex2, levels = c("1-Male", "2-Female"))
+cols = cor_targets$col_ipf[order(expr_values)]
+expr_values = expr_values[order(expr_values)]
+smoker2 <- cor_targets_smoker$smoker[order(expr_values)]
+smoker = factor(smoker2, levels = c("1-Current", "2-Ever (>100)", "3-Never"))
+
+x <- expr_values
+
+## Fit different linear models
+
+summary(lm(x ~ smoker))
+summary(lm(x ~ age + sex + smoker))
+summary(lm(x ~ age + smoker))
+summary(lm(x ~ sex + smoker))
+summary(lm(x ~ age + sex + age*sex*smoker))
+
+```
+There does not seem to be any linear relationship with smoker status, nor any increase in significance when adding smoker status in IPF. 
+
+Checking in CTRL:
+
+```{r}
+targets_only_CTRL_smoker = targets_smoker[targets_smoker$Condition == "CTRL",]
+targets_only_CTRL_smoker = targets_only_CTRL_smoker[targets_only_CTRL_smoker$Ild.subtype == "CTRL",]
+cor_targets_smoker = targets_only_CTRL_smoker
+Evalues = E3.avg$A[,cor_targets_smoker$FileName]
+
+
+## Get expression values for IL11
+j = "NM_000641"
+expr_values = Evalues[j,]
+
+## Get covariate levels
+age = as.numeric(cor_targets$Age)[order(expr_values)]
+sex2 = cor_targets$Sex[order(expr_values)]
+sex = factor(sex2, levels = c("1-Male", "2-Female"))
+cols = cor_targets$col_ipf[order(expr_values)]
+expr_values = expr_values[order(expr_values)]
+smoker2 <- cor_targets_smoker$smoker[order(expr_values)]
+smoker = factor(smoker2, levels = c("1-Current", "2-Ever (>100)", "3-Never"))
+
+x <- expr_values
+
+## Fit different linear models
+
+summary(lm(x ~ smoker))
+summary(lm(x ~ age + sex + smoker))
+summary(lm(x ~ age + smoker))
+summary(lm(x ~ sex + smoker))
+summary(lm(x ~ age + sex + age*sex*smoker))
+
+```
+There does not seem to be any linear relationship with smoker status, nor any increase in significance when adding smoker status in CTRL either. 
+
+Considering that there is no apparent benefit in including smoke, and lung functions are adjusted for age and sex only, the analysis would require multiple adjustments just to include smoker status with no obvious advantage. For this reason we will leave it out of the following analyses. 
+
+We then want to know whether there is any relationship between lung function and 3 *IL6* family cytokines (*IL11*, *IL6* and *OSM*), plus *IL13*, which was implicated in IPF pathogenesis. To do so we will do two types of analysis: fitting a linear model - within each patient class - in which log2(gene expression) is the predictor variable and lung function is the predicted variable, and Spearman correlations. However, since lung function is already adjusted for age and sex, we cannot just model the linear relationship adjusting both variables for those two covariates - lung function would be adjusted twice. So we first calculate the residuals of a linear model for log(gene expression), which, summed to the intercept of the model, will give us the "age- and sex-adjusted gene expression". Then, a simple linear model between lung function and adjusted gene expression of the model can be fit in order to draw the precise trendline of the scatterplot between lung function and gene expression.
+
+In order to know whether the assumptions for a linear model are met, we need again to know whether the residuals of the model are likely normally distributed. 
+
+We will do so using *IL11* in IPF samples:
+
+```{r, lungfunction_LM_residualstest, eval = TRUE, fig.width = 9, fig.height = 7}
+layout(matrix(1:6, nrow = 2))
+targets_only_IPF = targets_2[targets_2$Condition == "ILD",]
+targets_only_IPF = targets_only_IPF[targets_only_IPF$Ild.subtype == "2-UIP/IPF",]
+
+for( i in colnames(targets)[13:17])
+{	
+			cor_targets = targets_only_IPF[which(!is.na(targets_only_IPF[,i])),]
+			Evalues = E3.avg$A[,cor_targets$FileName]
+			j = "NM_000641"
+
+			expr_values = Evalues[j,]
+			lungf_values = as.numeric(cor_targets[,i])
+
+			age = as.numeric(cor_targets$Age)[order(expr_values)]
+			sex2 = cor_targets$Sex[order(expr_values)]
+			sex = factor(sex2, levels = c("1-Male", "2-Female"))
+			cols = cor_targets$col_ipf[order(expr_values)]
+			lungf_values = lungf_values[order(expr_values)]
+			expr_values = expr_values[order(expr_values)]
+
+			x <- expr_values
+			y <- lungf_values
+
+			#Fit first lm to adjust gene expression
+			fit1 <- lm(x ~ age + sex)
+			res1 = residuals(fit1)
+			adjx = res1 + fit1$coefficients[1]
+
+			#Fit lm with covariates
+			fit2 <- lm(y ~ adjx)
+
+
+			#Extract residuals
+			res2 = residuals(fit2)
+
+
+			at = nortest::ad.test(res2)
+			st = stats::shapiro.test(res2)
+			qqnorm(res2, main = paste(i, "LM residuals"))
+			qqline(res2, col = 'red')
+			legend('topleft', bty = 'n', legend = c(paste("AD p:", formatC(at$p.value, format = "e", digits = 3)), paste("WS p:", formatC(st$p.value, format = "e", digits = 3))))
+			hist(res2, breaks = 20, col = 'slateblue', border = NA, main = paste(i, 'LM residuals'))
+
+		
+}
+```
+
+In this case, only the residuals for DL<sub>CO</sub> % predicted seem to be departing significantly from a normal distribution. With a sample size this big (> 100 samples), however, we should still be able to fit a linear model. It is likely that the tails have thrown off the test. We can also determine normality in a more coarse way by looking at their histogram and notice how there is a tail of high residuals on the right-hand side. Some measurements are more sparse than others because not all lung functions were measured in all patients, or in the same set of patients.
+
+Given the presence of outliers, we can fit a robust linear model to confirm the relationship between IL11 and DL<sub>CO</sub> % predicted:
+
+```{r}
+
+			cor_targets = targets_only_IPF[which(!is.na(targets_only_IPF[,13])),]
+			lungf_values <- as.numeric(cor_targets[,13])
+			Evalues = E3.avg$A[,cor_targets$FileName]
+			j = "NM_000641"
+
+			expr_values = Evalues[j,]
+			age = as.numeric(cor_targets$Age)[order(expr_values)]
+			sex2 = cor_targets$Sex[order(expr_values)]
+			sex = factor(sex2, levels = c("1-Male", "2-Female"))
+			lungf_values = lungf_values[order(expr_values)]
+			expr_values = expr_values[order(expr_values)]
+			x <- expr_values
+			y <- lungf_values
+
+			## Get adjusted values
+			fit1 <- lm(x ~ age + sex)
+
+			res1 = residuals(fit1)
+
+			adjx = res1 + fit1$coefficients[1]
+			
+			## Fit robust linear model
+			fit3 <- robust::lmRob(y ~ adjx)
+
+summary(fit3)
+```
+The relationship is significant also for a robust model. 
+
+# Correlation analysis
+## Correlation with lung function - IPF
+
+In order to find a correlation between lung function and gen expression we need to calculate semi-partial correlations between lung function and log2(gene expression). Semi-partial correlations will only be corrected for gene expression and not for lung function (which is already adjusted). Moreover, as demonstrated earlier, we fit a robust linear model and a normal linear model between adjusted gene expression and lung function, and calculate the 95% confidence interval on the coefficient by bootstrapping. 
+
+```{r, semipart_correlation_IPF, eval = dofour}
+
+dofour = TRUE
+
+cytokines = c('IL11','IL13','OSM','IL6')
+
+NM_in_chip_ck = intersect(bm[bm$hgnc_symbol %in% cytokines,2], rownames(E3.avg$A))
+ck_nm = bm[bm$refseq_mrna %in% NM_in_chip_ck,]
+ 
+fibroid = cytokines
+fibroid_in_chip = intersect(bm[bm$hgnc_symbol %in% fibroid,2], rownames(E3.avg$A))
+fibroid_in_chip = bm[bm$refseq_mrna %in% fibroid_in_chip,]
+targets_only_IPF = targets_2[targets_2$Condition == "ILD",]
+targets_only_IPF = targets_only_IPF[targets_only_IPF$Ild.subtype == "2-UIP/IPF",]
+
+cordata_ipf = list()
+for( i in colnames(targets)[13:17])
+{	
+	cordata_ipf[[i]] = list()
+	cor_targets = targets_only_IPF[which(!is.na(targets_only_IPF[,i])),]
+	Evalues = E3.avg$A[,cor_targets$FileName]
+	resdf = matrix(ncol = 9)
+	for (j in fibroid_in_chip$refseq_mrna)
+		{
+
+			expr_values = Evalues[j,]
+			lungf_values = as.numeric(cor_targets[,i])
+
+			cor_targets$col_ipf = cor_targets$Ild.subtype
+			cor_targets$col_ipf = gsub(cor_targets$col_ipf, pattern = "2-UIP/IPF", replacement = "#27AAE1")
+
+			age = as.numeric(cor_targets$Age)[order(expr_values)]
+			sex2 = cor_targets$Sex[order(expr_values)]
+			sex = factor(sex2, levels = c("1-Male", "2-Female"))
+			cols = cor_targets$col_ipf[order(expr_values)]
+			lungf_values = lungf_values[order(expr_values)]
+			expr_values = expr_values[order(expr_values)]
+			sex2[sex2 == "1-Male"] = 0
+			sex2[sex2 == "2-Female"] = 1
+
+			ddf = data.frame("expr" = as.numeric(expr_values), "func" = as.numeric(lungf_values), "age" = as.numeric(age), "sex" = as.numeric(sex2))
+
+			x <- ddf$expr
+			y <- lungf_values
+
+			fit1 <- lm(x ~ age + sex)
+			res1 = residuals(fit1)
+			adjx = res1 + fit1$coefficients[1]
+
+		
+			#Fit lm without covariates
+			fit2 <- lm(y ~ adjx)
+			fit3 <- robust::lmRob(y ~ adjx)
+
+			flmp = summary(fit2)$coefficients[2,4]
+			flmb = summary(fit2)$coefficients[2,1]
+			rlmb = summary(fit3)$coefficients[2,1]
+
+			ddf2 = data.frame("epxr" = as.numeric(adjx), "func" = as.numeric(lungf_values))
+			
+			spct = RVAideMemoire::pcor.test(x = ddf$func, y = ddf$expr, z = ddf[,3:4], method = 'spearman', semi = TRUE, conf.level = 0.95)
+			corrho = spct$estimate
+			corp = spct$p.value
+			corconf = spct$conf.int
+
+			lmboot = function(data, b)
+			{  
+				d = data[b,]
+				return(lm(d[,2]~d[,1], data = d)$coef)  
+			}
+
+			bootst_coefs = boot::boot(data = ddf2, statistic=lmboot, R=5000)
+			boot_ci = car::Confint(bootst_coefs, level = 0.95)
+
+			allres = c(flmp, flmb, corrho, corp, corconf[1], corconf[2], rlmb, boot_ci[2,1], boot_ci[2,2])
+			resdf = rbind(resdf, allres)
+			colnames(resdf) = c("Full_lm_pval", "Full_lm_beta1", "Spearman_semipartial_rho", "Spearman_semipartial_pval", "Spearman_95CI_Inf", "Spearman_95CI_Sup","Robust_lm_beta", "Beta_95CI_Inf", "Beta_95CI_Sup")
+			pdf(file = paste("./Lung_Function_Correlations/",i, "/", fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3],"_vs_", i, "_IPFonly.pdf",sep=""), useDingbats = F, width = 7, height = 7)
+			plot(adjx, y, pch = 16, cex = 0.7, xlab = paste('Age- and sex- adjusted log2(', fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3], ')', sep = ""), col = cols , ylab = i, main = paste(fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3]," and ", i, sep=""), las = 1)
+			abline(fit2$coefficients[1:2], col='red')
+			legend('topright', bty = 'n', legend = c(paste("Correlation [95% CI] = ", as.numeric(round(corrho, digits = 3)), " [", round(corconf[1],3),", ",round(corconf[2],3), "]", sep = ''), paste("Correlation p =", formatC(corp, digits = 3, format = "e"), sep = " "), paste("LM p =", formatC(flmp, digits = 3, format = "e"), sep = " "), paste("LM beta [95% CI] = ", round(flmb, digits = 3), "[", round(boot_ci[2,1], digits = 3), ", ", round(boot_ci[2,2], digits = 3), "]", sep = "")), cex = 0.7)
+			dev.off()
+
+		}
+		cordata_ipf[[i]] = as.data.frame(resdf[2:nrow(resdf),])
+		rownames(cordata_ipf[[i]]) = fibroid_in_chip$refseq_mrna
+		cordata_ipf[[i]]$gene = fibroid_in_chip$hgnc_symbol
+		write.table(file = paste("./Lung_Function_Correlations/", i, "/", i, "_IPF_LungFunction_correlations_table.txt",sep = ""), cordata_ipf[[i]], quote = F, sep = "\t")
+
+		dofour = FALSE
+
+}
+
+```
+
+We now generate the bubble map for these cytokines in IPF:
+
+```{r, bubblemap_lungfunction_IPF, fig.height = 10, fig.width = 8}
+alldf_ipf = do.call(cbind, cordata_ipf)
+pdf_ipf = alldf_ipf[,seq(4, (10*length(cordata_ipf)), by = 10)]
+cordf_ipf = alldf_ipf[,seq(3, (10*length(cordata_ipf)), by = 10)]
+padjdf_ipf = as.data.frame(t(apply(pdf_ipf, 1, FUN = function(x) p.adjust(x, method = 'fdr'))))
+colnames(cordf_ipf) = c("DLCO", "FEV1_postBD", "FEV1_preBD", "FVC_postBD", "FVC_preBD")
+rownames(fibroid_in_chip) = fibroid_in_chip$refseq_mrna
+rownames(cordf_ipf) = fibroid_in_chip[rownames(cordf_ipf), 3]
+par(mar = c(5,2,2,6))
+bubbleMap(cordf_ipf, padjdf_ipf, color_pal = viridis(25, option = "C"), main = "Semi-partial correlation with lung function in IPF", cex.binned = F, cbins = 5)
+```
+<br>
+
+*IL11* is the most negatively correlated with DL<sub>CO</sub> % predicted, which is the most important index for IPF severity. A low DLCO means high disease severity, so a high negative correlation means that there is an inverse relationship with lung function and *IL11* expression. Other lung function measurements are correlated, but we must remember that the difference in FEV1 is not statistically significant between healthy individuals and IPF patients. 
+
+## Correlation with lung function - CTRL
+
+We do the same analyis in the control, trying to understand whether the same correlations hold true for healthy patients. 
+
+```{r, semipartial_correlation_CTRL, eval = dofive}
+
+dofive = TRUE
+
+targets_only_CTRL = targets_2[targets_2$Condition == "CTRL",]
+targets_only_CTRL = targets_only_CTRL[targets_only_CTRL$Ild.subtype == "CTRL",]
+
+cordata_ctrl = list()
+for( i in colnames(targets)[13:17])
+{	
+	cordata_ctrl[[i]] = list()
+	cor_targets = targets_only_CTRL[which(!is.na(targets_only_CTRL[,i])),]
+	Evalues = E3.avg$A[,cor_targets$FileName]
+	resdf = matrix(ncol = 9)
+	for (j in fibroid_in_chip$refseq_mrna)
+		{
+
+			expr_values = Evalues[j,]
+			lungf_values = as.numeric(cor_targets[,i])
+
+			cor_targets$col_ipf = cor_targets$Ild.subtype
+			cor_targets$col_ipf = gsub(cor_targets$col_ipf, pattern = "CTRL", replacement = "#606161")
+
+			age = as.numeric(cor_targets$Age)[order(expr_values)]
+			sex2 = cor_targets$Sex[order(expr_values)]
+			sex = factor(sex2, levels = c("1-Male", "2-Female"))
+			cols = cor_targets$col_ipf[order(expr_values)]
+			lungf_values = lungf_values[order(expr_values)]
+			expr_values = expr_values[order(expr_values)]
+			sex2[sex2 == "1-Male"] = 0
+			sex2[sex2 == "2-Female"] = 1
+
+			ddf = data.frame("expr" = as.numeric(expr_values), "func" = as.numeric(lungf_values), "age" = as.numeric(age), "sex" = as.numeric(sex2))
+
+			x <- ddf$expr
+			y <- lungf_values
+
+			## Get adjusted expression values
+			fit1 <- lm(x ~ age + sex)
+			res1 = residuals(fit1)
+			adjx = res1 + fit1$coefficients[1]
+			
+		
+			## Fit lm without covariates
+			fit2 <- lm(y ~ adjx)
+
+			## Fit robust lm
+			fit3 <- robust::lmRob(y ~ adjx)
+
+
+			flmp = summary(fit2)$coefficients[2,4]
+			flmb = summary(fit2)$coefficients[2,1]
+			rlmb = summary(fit3)$coefficients[2,1]
+
+			ddf2 = data.frame("epxr" = as.numeric(adjx), "func" = as.numeric(lungf_values))
+			
+			lmboot = function(data, b)
+			{  
+				d = data[b,]
+				return(lm(d[,2]~d[,1], data = d)$coef)  
+			}
+
+			bootst_coefs = boot::boot(data = ddf2, statistic=lmboot, R=5000)
+			boot_ci = car::Confint(bootst_coefs, level = 0.95)
+
+			
+			spct = RVAideMemoire::pcor.test(x = ddf$func, y = ddf$expr, z = ddf[,3:4], method = 'spearman', semi = TRUE, conf.level = 0.95)
+			corrho = spct$estimate
+			corp = spct$p.value
+			corconf = spct$conf.int
+
+
+			allres = c(flmp, flmb, corrho, corp, corconf[1], corconf[2], rlmb, boot_ci[2,1], boot_ci[2,2])
+			resdf = rbind(resdf, allres)
+			colnames(resdf) = c("Full_lm_pval", "Full_lm_beta", "Spearman_semipartial_rho", "Spearman_semipartial_pval", "Spearman_95CI_Inf", "Spearman_95CI_Sup", "Robust_lm_beta", "Beta_95CI_Inf", "Beta_95CI_Sup")
+			pdf(file = paste("./Lung_Function_Correlations/",i, "/", i, fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3],"_vs_", i, "_CTRLonly.pdf",sep=""), useDingbats = F, width = 7, height = 7)
+			plot(adjx, y, pch = 16, cex = 0.7, xlab = paste('Age- and sex- adjusted log2(', fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3], ')', sep = ""), col = cols , ylab = i, main = paste(fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3]," and ", i, sep=""), las = 1)
+			abline(fit2$coefficients[1:2], col='red')
+			legend('topright', bty = 'n', legend = c(paste("Correlation [95% CI] = ", as.numeric(round(corrho, digits = 3)), " [", round(corconf[1],3),", ",round(corconf[2],3), "]", sep = ''), paste("Correlation p =", formatC(corp, digits = 3, format = "e"), sep = " "), paste("LM p =", formatC(flmp, digits = 3, format = "e"), sep = " "), paste("LM beta [95% CI] = ", round(flmb, digits = 3), "[", round(boot_ci[2,1], digits = 3), ", ", round(boot_ci[2,2], digits = 3), "]", sep = "")), cex = 0.7)
+		dev.off()
+		}
+		cordata_ctrl[[i]] = as.data.frame(resdf[2:nrow(resdf),])
+		rownames(cordata_ctrl[[i]]) = fibroid_in_chip$refseq_mrna
+		cordata_ctrl[[i]]$gene = fibroid_in_chip$hgnc_symbol
+		write.table(file = paste("./Lung_Function_Correlations/", i, "/", i, "_CTRL_LungFunction_correlations_table.txt",sep = ""), cordata_ctrl[[i]], quote = F, sep = "\t")
+}
+
+dofive = FALSE
+
+```
+
+We now generate the bubble map for these cytokines in CTRL:
+
+```{r, bubblemap_lungfunction_CTRL, fig.height = 10, fig.width = 8}
+alldf_ctrl = do.call(cbind, cordata_ctrl)
+pdf_ctrl = alldf_ctrl[,seq(4, (10*length(cordata_ctrl)), by = 10)]
+cordf_ctrl = alldf_ctrl[,seq(3, (10*length(cordata_ctrl)), by = 10)]
+padjdf_ctrl = as.data.frame(t(apply(pdf_ctrl, 1, FUN = function(x) p.adjust(x, method = 'fdr'))))
+colnames(cordf_ctrl) = c("DLCO", "FEV1_postBD", "FEV1_preBD", "FVC_postBD", "FVC_preBD")
+rownames(fibroid_in_chip) = fibroid_in_chip$refseq_mrna
+rownames(cordf_ctrl) = fibroid_in_chip[rownames(cordf_ctrl), 3]
+par(mar = c(5,2,2,6))
+bubbleMap(cordf_ctrl, padjdf_ctrl, color_pal = viridis(25, option = "C"), main = "Semi-partial correlation with lung function in control", cex.binned = F, cbins = 5)
+```
+
+We try another type of plot that captures all the information above:
+
+```{r, scatter_correlation_lung, fig.height = 8, fig.width = 8}
+plot(x = c(do.call(c,cordf_ipf),do.call(c,cordf_ctrl)), y = -log10(c(do.call(c,padjdf_ipf), do.call(c,padjdf_ctrl))), pch = rep(1:5,each = 10) , col = c(rep('salmon', 20), rep('purple', 20)), xlab = "Spearman semi-partial correlation", ylab = "-log10(FDR) correlation test", xlim = c(-0.4, 0.2), main = "IL-6 family and lung function correlation")
+abline(h = 1.3, lty = 2, col = 'gray')
+abline(v = 0, lty = 2, col = 'gray')
+text(x = c(do.call(c,cordf_ipf),do.call(c,cordf_ctrl)), 
+	y = -log10(c(do.call(c,padjdf_ipf), do.call(c,padjdf_ctrl))), 
+	labels = rep(fibroid_in_chip[rownames(padjdf_ipf),3], 10), 
+	cex = 0.5, 
+	pos = plotrix::thigmophobe(
+		x = c(do.call(c,cordf_ipf),do.call(c,cordf_ctrl)), 
+		y = -log10(c(do.call(c,padjdf_ipf), do.call(c,padjdf_ctrl)))
+		)
+	)
+legend("topright", bty = "n", pch = c(1:5, 1,1), legend = c("DLCO %pred", "FEV1 post-BD %pred", "FEV1 pre-BD %pred", "FVC post-BD %pred", "FVC pre-BD %pred", "CTRL", "IPF"), col = c(rep('black', 5), "purple", "salmon"), pt.cex = 1, cex = 0.6, title = "Symbol legend")
+```
+
+While slightly more cluttered than the former plots, this scatterplot shows that IL11 is the most significant, most negatively correlated gene (amongst the 4 cytokines) with DLCO. 
+
+## Fibrosis genes
+We can do a similar analysis correlating the expression of IL6-family cytokines (plus IL13) to fibrosis genes: FN1, ACTA2, Collagens (1A1/1A2/2A1), TIMP1, MMP2 and MMP9. As opposed to earlier, this has to be a partial correlation analysis, since both gene expression values will have to be corrected for age and sex.
+We first look at their differences according to the limma analysis:
+
+```{r, fibrosis_genes_boxplots, fig.width = 9, fig.height = 11}
+mkrs_nm_fib_l = bm[bm$hgnc_symbol %in% c("FN1", "ACTA2", "COL3A1", "COL1A1", "COL1A2", "TIMP1", "MMP2", "MMP9"),]
+mkrs_nm_fib = bm[bm$refseq_mrna %in% intersect(mkrs_nm_fib_l$refseq_mrna, rownames(E3.avg$A)),]
+rownames(mkrs_nm_fib) = mkrs_nm_fib$ensembl_gene_id
+layout(matrix(1:8, nrow = 4))
+for(i in rownames(mkrs_nm_fib))
+{	
+	par(mar=c(2,4,2,1))
+	beeswarm(E3.avg$A[mkrs_nm_fib[i,2],targets_2$FileName] ~ targets_2$Condition, method = 'swarm', pch = 21, col = c("purple", "salmon"), cex = 0.6, bg = 'white', ylab = paste('log2(',mkrs_nm_fib[i,3],' avg exp)', sep = ""), xlab = NA, main = mkrs_nm_fib[i,3], ylim = c(0,max(E3.avg$A[mkrs_nm_fib[i,2],targets_2$FileName])+2))
+	boxplot(E3.avg$A[mkrs_nm_fib[i,2],targets_2$FileName] ~ targets_2$Condition, col = NA, border = 'black', lwd = 1, pch = 21, bg = 'white', xaxt = 'n', yaxt = 'n', outline = F, boxwex = 0.5, add = T)
+	segments(x0 = 1, x1 = 2, y0 = max(E3.avg$A[mkrs_nm_fib[i,2],targets_2$FileName])+1, y1 = max(E3.avg$A[mkrs_nm_fib[i,2],targets_2$FileName])+1)
+	text(x = 1.5, y = max(E3.avg$A[mkrs_nm_fib[i,2],targets_2$FileName])+1.5, labels = formatC(tt_ILD_3[tt_ILD_3$SystematicName == mkrs_nm_fib[i,2],9], format = 'e', digits = 3))
+
+}
+```
+
+## Correlation with fibrosis genes - IPF
+
+We then calculate gene-wise correlations in IPF:
+
+```{r, partial_correlation_fibrosis_IPF, eval = TRUE}
+corlist_ck_IPFonly = list()
+
+for(j in mkrs_nm_fib$refseq_mrna)
+	{			
+				resdf = matrix(ncol = 4)
+				Evalues = E3.avg$A[,targets_only_IPF$FileName]
+				if(is.infinite(sum(as.numeric(log2(Evalues[j,]))))) next
+				corlist_ck_IPFonly[[as.character( mkrs_nm_fib[mkrs_nm_fib$refseq_mrna == j,3])]] = list()
+		for(i in ck_nm$refseq_mrna) 
+
+			{
+				ck_expression = Evalues[i,]
+				fib_expression = Evalues[j,]
+				age = as.numeric(targets_only_IPF$Age)[order(ck_expression)]
+				sex2 = targets_only_IPF$Sex[order(ck_expression)]
+				sex = factor(sex2, levels = c("1-Male", "2-Female"))
+				fib_expression = fib_expression[order(ck_expression)]
+				ck_expression = ck_expression[order(ck_expression)]
+				sex2[sex2 == "1-Male"] = 0
+				sex2[sex2 == "2-Female"] = 1
+
+				ddf = data.frame("expr_c" = as.numeric(ck_expression), "expr_f" = as.numeric(fib_expression), "age" = as.numeric(age), "sex" = as.numeric(sex2))
+
+				spct = RVAideMemoire::pcor.test(x = ddf$expr_c, y = ddf$expr_f, z = ddf[,3:4], method = 'spearman', semi = FALSE, conf.level = 0.95)
+				corrho = spct$estimate
+				corp = spct$p.value
+				corconf = spct$conf.int
+
+
+				allres = c(corrho, corp, corconf[1], corconf[2])
+				resdf = rbind(resdf, allres)
+				
+			}
+			corlist_ck_IPFonly[[as.character( mkrs_nm_fib[mkrs_nm_fib$refseq_mrna == j,3])]][[ ck_nm[ck_nm$refseq_mrna == i,3]]] = resdf[2:nrow(resdf),]
+			genesymbol <-mkrs_nm_fib$hgnc_symbol[ which(mkrs_nm_fib$refseq_mrna == j)]
+		write.table(file = paste("./Fibrosis_Genes_Correlations/", genesymbol, "/", genesymbol, "_IPF_Fibrosis_correlations_table.txt", sep = ""), resdf, quote = F, sep = "\t")
+	}
+
+```
+
+The bubblemap reveals that IL11 is the only gene correlating with other fibrosis markers in IPF:
+```{r, bubblemap_fibrosis_IPF, fig.height = 10, fig.width = 8}
+alldf_fib_ipf = as.data.frame(do.call(cbind, (do.call(cbind, corlist_ck_IPFonly))), stringsAsFactors = F)
+rownames(alldf_fib_ipf) = ck_nm$hgnc_symbol
+pdf_fib_ipf = alldf_fib_ipf[,seq(2, (4*length(corlist_ck_IPFonly)), by = 4)]
+cordf_fib_ipf = alldf_fib_ipf[,seq(1, (4*length(corlist_ck_IPFonly)), by = 4)]
+padjdf_fib_ipf = as.data.frame(t(apply(pdf_fib_ipf, 1, FUN = function(x) p.adjust(x, method = 'fdr'))))
+colnames(cordf_fib_ipf) = mkrs_nm_fib$hgnc_symbol
+par(mar = c(5,2,2,6))
+bubbleMap(cordf_fib_ipf, padjdf_fib_ipf, color_pal = viridis(25, option = "D"), main = "Partial correlation with fibrosis genes in IPF", cex.binned = F, cbins = 5)
+```
+
+## Correlation with fibrosis genes - CTRL
+
+We repeat the analysis in control tissues:
+
+```{r, partial_correlations_fibrosis_CTRL, eval = TRUE}
+corlist_ck_CTRLonly = list()
+
+for(j in mkrs_nm_fib$refseq_mrna)
+	{			
+				resdf = matrix(ncol = 4)
+				Evalues = E3.avg$A[,targets_only_CTRL$FileName]
+				if(is.infinite(sum(as.numeric(log2(Evalues[j,]))))) next
+				corlist_ck_CTRLonly[[as.character( mkrs_nm_fib[mkrs_nm_fib$refseq_mrna == j,3])]] = list()
+		for(i in ck_nm$refseq_mrna) 
+
+			{
+				ck_expression = Evalues[i,]
+				fib_expression = Evalues[j,]
+				age = as.numeric(targets_only_IPF$Age)[order(ck_expression)]
+				sex2 = targets_only_IPF$Sex[order(ck_expression)]
+				sex = factor(sex2, levels = c("1-Male", "2-Female"))
+				fib_expression = fib_expression[order(ck_expression)]
+				ck_expression = ck_expression[order(ck_expression)]
+				sex2[sex2 == "1-Male"] = 0
+				sex2[sex2 == "2-Female"] = 1
+
+				ddf = data.frame("expr_c" = as.numeric(ck_expression), "expr_f" = as.numeric(fib_expression), "age" = as.numeric(age), "sex" = as.numeric(sex2))
+
+				spct = RVAideMemoire::pcor.test(x = ddf$expr_c, y = ddf$expr_f, z = ddf[,3:4], method = 'spearman', semi = FALSE, conf.level = 0.95)
+				corrho = spct$estimate
+				corp = spct$p.value
+				corconf = spct$conf.int
+
+				allres = c(corrho, corp, corconf[1], corconf[2])
+				resdf = rbind(resdf, allres)
+				
+			}
+			genesymbol <- mkrs_nm_fib$hgnc_symbol[ which(mkrs_nm_fib$refseq_mrna == j)]
+			corlist_ck_CTRLonly[[as.character( mkrs_nm_fib[mkrs_nm_fib$refseq_mrna == j,3])]][[ ck_nm[ck_nm$refseq_mrna == i,3]]] = resdf[2:nrow(resdf),]
+		write.table(file = paste("./Fibrosis_Genes_Correlations/", genesymbol, "/", genesymbol, "_CTRL_Fibrosis_correlations_table.txt", sep = ""), resdf, quote = F, sep = "\t")
+	}
+
+```
+
+Repeating the analysis only in controls reveals a different pattern, in which the only significant correlations for IL11 are with TIMP1 and COL3A1:
+
+```{r, bubblemap_fibrosis_CTRL, fig.height = 10, fig.width = 9}
+alldf_fib_ctrl = as.data.frame(do.call(cbind, (do.call(cbind, corlist_ck_CTRLonly))), stringsAsFactors = F)
+rownames(alldf_fib_ctrl) = ck_nm$hgnc_symbol
+pdf_fib_ctrl = alldf_fib_ctrl[,seq(2, (4*length(corlist_ck_CTRLonly)), by = 4)]
+cordf_fib_ctrl = alldf_fib_ctrl[,seq(1, (4*length(corlist_ck_CTRLonly)), by = 4)]
+padjdf_fib_ctrl = as.data.frame(t(apply(pdf_fib_ctrl, 1, FUN = function(x) p.adjust(x, method = 'fdr'))))
+colnames(cordf_fib_ctrl) = mkrs_nm_fib$hgnc_symbol
+par(mar = c(5,2,2,6))
+bubbleMap(cordf_fib_ctrl, padjdf_fib_ctrl, color_pal = viridis(25, option = "D"), main = "Partial correlation with fibrosis genes in control", cex.binned = F, cbins = 5)
+```
+
+
+We try again the scatterplot mixing all the information:
+
+```{r, scatter_correlation_fibrosis, fig.height = 8, fig.width = 8}
+fibroid_in_chip_2 = fibroid_in_chip[]
+plot(x = c(do.call(c,cordf_fib_ipf),do.call(c,cordf_fib_ctrl)), y = -log10(c(do.call(c,padjdf_fib_ipf), do.call(c,padjdf_fib_ctrl))), pch = rep(1:8, each = 10) , col = c(rep('salmon', 32), rep('purple', 32)), xlab = "Spearman partial correlation", ylab = "-log10(FDR) correlation test", xlim = c(-0.5, 0.5), main = "IL-6 family and fibrosis gene expression correlation")
+abline(h = 1.3, lty = 2, col = 'gray')
+abline(v = 0, lty = 2, col = 'gray')
+text(x = c(do.call(c,cordf_fib_ipf),do.call(c,cordf_fib_ctrl)), 
+	y = -log10(c(do.call(c,padjdf_fib_ipf), do.call(c,padjdf_fib_ctrl))), 
+	labels = rep(fibroid_in_chip[rownames(padjdf_ipf),3], 16), 
+	cex = 0.5, 
+	pos = plotrix::thigmophobe(
+		x = c(do.call(c,cordf_fib_ipf),do.call(c,cordf_fib_ctrl)), 
+		y = -log10(c(do.call(c,padjdf_fib_ipf), do.call(c,padjdf_fib_ctrl)))
+		)
+	)
+legend("topleft", bty = "n", pch = c(1:8, 1,1), legend = c(mkrs_nm_fib$hgnc_symbol, "CTRL", "IPF"), col = c(rep('black', 8), "purple", "salmon"), pt.cex = 1, cex = 0.6, title = "Symbol legend")
+```
+
+While this is far from being easily readable, we can see how *IL11* correlates positively and significantly with *TIMP1*, *MMP2*, *COL3A1*, *COL1A1*, *ACTA2* in IPF. 
+
+
+## Bubblemaps using both CTRL and IPF
+
+We plot the same bubblemaps as before, only mixing IPF and CTRL in order to have the same scaling of dots and colours. Moreover we switch to a divergent color scale, more suitable for correlation values.
+
+Lung function bubblemap:
+
+```{r, LF_all_bubblemap, fig.height = 10, fig.width = 8, eval = TRUE}
+
+colnames(cordf_ctrl) <- paste0(colnames(cordf_ctrl), "_CTRL")
+colnames(cordf_ipf) <- paste0(colnames(cordf_ipf), "_IPF")
+
+colnames(padjdf_ctrl) <- paste0(colnames(padjdf_ctrl), "_CTRL")
+colnames(padjdf_ipf) <- paste0(colnames(padjdf_ipf), "_IPF")
+
+cordf_lf_both <- cbind(cordf_ctrl, cordf_ipf)
+padjdf_lf_both <- cbind(padjdf_ctrl, padjdf_ipf)
+rownames(padjdf_lf_both) <- rownames(cordf_lf_both)
+
+cordf_lf_both <- cordf_lf_both[c("OSM", "IL11", "IL6", "IL13"),]
+padjdf_lf_both <- padjdf_lf_both[c("OSM", "IL11", "IL6", "IL13"),]
+
+pal = colorspace::divergingx_hcl(25, "RdBu", rev = FALSE)[4:22]
+
+par(mar = c(8,2,2,6))
+bubbleMap(cordf_lf_both, padjdf_lf_both, color_pal = pal, main = "Semipartial correlation with lung function in IPF and CTRL", cex.binned = FALSE, cbins = 5)
+```
+
+Fibrosis genes bubblemap:
+
+```{r, FIB_all_bubblemap, fig.height = 10, fig.width = 8, eval = TRUE}
+
+alldf_fib_ipf = as.data.frame(do.call(cbind, (do.call(cbind, corlist_ck_IPFonly))), stringsAsFactors = F)
+alldf_fib_ctrl = as.data.frame(do.call(cbind, (do.call(cbind, corlist_ck_CTRLonly))), stringsAsFactors = F)
+
+rownames(alldf_fib_ctrl) = ck_nm$hgnc_symbol
+rownames(alldf_fib_ipf) = ck_nm$hgnc_symbol
+
+colnames(cordf_fib_ctrl) <- paste0(colnames(cordf_fib_ctrl), "_CTRL")
+colnames(cordf_fib_ipf) <- paste0(colnames(cordf_fib_ipf), "_IPF")
+
+colnames(padjdf_fib_ctrl) <- paste0(colnames(padjdf_fib_ctrl), "_CTRL")
+colnames(padjdf_fib_ipf) <- paste0(colnames(padjdf_fib_ipf), "_IPF")
+
+cordf_both <- cbind(cordf_fib_ctrl, cordf_fib_ipf)
+padjdf_both <- cbind(padjdf_fib_ctrl, padjdf_fib_ipf)
+
+cordf_both <- cordf_both[c("OSM", "IL11", "IL6", "IL13"),]
+padjdf_both <- padjdf_both[c("OSM", "IL11", "IL6", "IL13"),]
+
+pal = colorspace::divergingx_hcl(25, "PuOr", rev = TRUE)[4:22]
+
+par(mar = c(8,2,2,6))
+bubbleMap(cordf_both, padjdf_both, color_pal = pal, main = "Partial correlation with fibrosis genes in IPF and CTRL", cex.binned = FALSE, cbins = 5)
+```
+
+```{r, save_file}
+if(doit) save(list = ls(), file = "Microarray_Analysis_Final.RData")
+```
+
+# Session info
+
+```{r, sessioninfo}
+sessionInfo()
+```
+
+ <div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
