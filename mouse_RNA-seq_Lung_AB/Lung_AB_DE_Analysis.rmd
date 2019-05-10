@@ -1,0 +1,393 @@
+---
+title: "Mouse lung BLM + AB RNA-seq analysis"
+author: Giuseppe D'Agostino
+date: "`r format(Sys.time(), '%d %B, %Y')`" 
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        theme: 'cosmo'
+        highlight: 'tango'
+        code_folding: hide
+        df_print: paged
+---
+
+# Intro
+
+This is the RNA-seq differential expression analysis for a prevention experiment using the X203 antibody during 3 weeks of bleomycin treatment in mice. Lungs are harvested, the RNA is extracted and sequenced. The 3 conditions are Saline (no bleomycin), IgG (bleomycin + IgG, control) and X203 (bleomycin + X203, treatment).
+
+# Library loading
+
+
+```{r, echo = TRUE, results = "hide"}
+libs = c("DESeq2", "sva", "edgeR", "tidyverse", "biomaRt", "beeswarm", "gplots", "pheatmap", "viridis", "treemapify", "ggplot2", "scales", "colorspace", "MSigDB", "fgsea")
+suppressMessages({lapply(libs, require, character.only = TRUE)})
+source("helper_functions.R")
+while (dev.cur()>1) dev.off()
+```
+
+
+#Data loading
+
+The gene-level count table and the sample names table are loaded. Counts are formatted and the coldata object is created.
+
+```{r, eval = TRUE}
+
+#Load the counttable and sample names files
+counttable <- read.delim("Lung_mouse_all.counts", header = T, comment.char = '#', stringsAsFactors = F)
+samplesheet <- read.delim("samplesheet.txt", header = T, stringsAsFactors = F)
+colnames(counttable)[7:18] <- gsub(colnames(counttable)[7:18], pattern = ".Aligned.sortedByCoord.out.bam", replacement = "")
+counttable = counttable[,c(1,6,7:18)]
+
+#Row names as sample ID in samplesheet
+rownames(samplesheet) <- samplesheet$Sample_ID
+
+#Change colnames of counttable to Description from samplesheet
+colnames(counttable)[3:14] = samplesheet[colnames(counttable)[3:14],7]
+
+#Use geneid as rownames in counttable table
+rownames(counttable) = counttable$Geneid
+counttable$Geneid = NULL
+
+#Make coldata
+coldata = as.data.frame(colnames(counttable)[2:13])
+coldata$treatment = rep(c("Saline", "IgG", "X203"), 4)
+coldata$batch = rep(c("1","2","3","4"), each = 3)
+colnames(coldata)[1] = "sample"
+rownames(coldata) = coldata$sample
+coldata$treatmentColor = rep(c("gray", "purple", "salmon"), 4)
+colnames(counttable)[2:13] = paste(coldata$treatment, coldata$batch, sep = "_")
+
+#Obtain gene symbols from biomart
+ensembl = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+mapping <- getBM(attributes = c("ensembl_gene_id", "mgi_symbol"), mart = ensembl)
+mapping <- mapping[-which(duplicated(mapping[,1])),]
+rownames(mapping) <- mapping[,1]
+mapping2 <- mapping[rownames(counttable),]
+
+#Get the orthologs between human and mouse
+mart <- useDataset("mmusculus_gene_ensembl", mart=useMart("ensembl"))
+bm <- getBM(attributes=c("ensembl_gene_id", "hsapiens_homolog_associated_gene_name"), mart=mart) %>%
+  distinct() %>%
+  as_tibble() %>%
+  na_if("") %>% 
+  na.omit()
+bm = as.data.frame(bm)
+
+```
+# Quality control
+
+## Number of reads
+
+```{r}
+par(mar = c(5,5,2,2))
+barplot(colSums(counttable[,2:13]), las = 2, border = NA, col = "slateblue", main = "Gene-level count sample size", ylab = "counts")
+```
+
+We have plenty of counttable to perform direffential expression accurately.
+
+##PCA
+
+```{r}
+genetable <- data.frame(gene.id=rownames(counttable))
+z <- DGEList(counts=counttable[,2:13], samples=coldata, genes=genetable)
+my_mod = model.matrix(~ z$samples$treatment)
+All_norm <- calcNormFactors(z, method="upperquartile")
+my_data = cpm(All_norm, log=TRUE, prior.count=2)
+plot_PCA_2(my_data, 1, 2, coldata, coldata$treatmentColor, symbol = 16, main = "PCA of log2(CPM)", lab1 = coldata$treatment, lab2 = coldata$batch)
+
+
+```
+<br>
+The PCA shows that the first principal component separates properly the 3 treatments, and that the X203 treatment is intermediate between Saline and IgG. However, the position of X203_3 suggests that it is an outlier. Since we have at least 3 samples per treatment, we can remove it. However we first check Cook's distance distributions:
+
+```{r}
+rownames(coldata) <- colnames(counttable[,2:13])
+ddsmat_all = DESeqDataSetFromMatrix(countData = counttable[,2:13], colData = coldata, design = ~ treatment)
+#Estimate size factors: necessary to generate a normalized count table
+ddsmat_all = estimateSizeFactors(ddsmat_all)
+
+#Remove genes with 0 counttable in all samples to speed computation up
+ddsmat_all_ne = ddsmat_all[rowSums(counts(ddsmat_all)) > 1, ]
+
+#Differential expression
+dds = DESeq(ddsmat_all_ne)
+boxplot(log10(assays(dds)[["cooks"]]), border = c(rep("black", 8), "red", rep("black", 3)))
+```
+Although it does not seem to be extremely out of line, we remove it.
+
+# Outlier removal
+
+```{r}
+
+
+counttable_2 = counttable[,-10]
+
+#Make coldata
+coldata_2 = as.data.frame(colnames(counttable_2)[2:12])
+coldata_2$treatment = c("Saline", "IgG", "X203", "Saline", "IgG", "X203", "Saline", "IgG", "Saline", "IgG", "X203")
+colnames(coldata_2)[1] = "sample"
+rownames(coldata_2) = coldata_2$sample
+coldata_2$treatmentColor = c("gray", "purple", "salmon", "gray", "purple", "salmon", "gray", "purple", "gray", "purple", "salmon")
+
+
+
+genetable <- data.frame(gene.id=rownames(counttable_2))
+z <- DGEList(counts=counttable_2[,2:12], samples=coldata_2, genes=genetable)
+my_mod = model.matrix(~ z$samples$treatment)
+All_norm <- calcNormFactors(z, method="upperquartile")
+my_data = cpm(All_norm, log=TRUE, prior.count=2)
+
+ plot_PCA_2(my_data, 1, 2, coldata_2, coldata_2$treatmentColor, symbol = 16, main = "PCA of log2(CPM)", lab1 = coldata_2$treatment, lab2 = coldata_2$batch)
+
+```
+<br>
+Without the outlier, the PCA clusters correctly by treatment along PC1.
+
+# Differential expression
+
+We perform the differential expression analysis using DESeq2, shrinking the log2FoldChanges.
+
+```{r, eval = TRUE}
+#Import the count table into a DESEq object
+ddsmat_2_all = DESeqDataSetFromMatrix(counttable_2[,2:12], colData = coldata_2, design = ~ treatment)
+#Estimate size factors: necessary to generate normalized counttable
+ddsmat_2_all = estimateSizeFactors(ddsmat_2_all)
+
+#Remove genes with 0 counttable in all samples to speed computation up
+ddsmat_2_all_ne = ddsmat_2_all[rowSums(counts(ddsmat_2_all)) > 1, ]
+
+#Differential expression
+dds_2 = DESeq(ddsmat_2_all_ne)
+
+#Extract results: non shrunk (ns) log2(FC) to compare with shrunk ones
+res_2_ns_IgG_X203 = results(dds_2, contrast = c("treatment", "IgG", "X203"), alpha = 0.05)
+res_2_ns_IgG_Saline = results(dds_2, contrast = c("treatment", "IgG", "Saline"), alpha = 0.05)
+res_2_ns_X203_Saline = results(dds_2, contrast = c("treatment", "X203", "Saline"), alpha = 0.05)
+
+#FC shrinkage
+res_2_X203_IgG = lfcShrink(dds_2, contrast = c("treatment", "X203", "IgG"))
+res_2_IgG_Saline = lfcShrink(dds_2, contrast = c("treatment", "IgG", "Saline"))
+res_2_X203_Saline = lfcShrink(dds_2, contrast = c("treatment", "X203", "Saline"))
+
+
+#Create a results list
+reslist_2 = list("res_2_X203_IgG" = res_2_X203_IgG, "res_2_IgG_Saline" = res_2_IgG_Saline, "res_2_X203_Saline" = res_2_X203_Saline)
+
+for (i in names(reslist_2))
+{
+	reslist_2[[i]] = as.data.frame(reslist_2[[i]]) #conversion of DESeq results object to data frame
+	reslist_2[[i]]$gene = mapping2[rownames(reslist_2[[i]]), 2] #add MGI gene symbols 
+}
+
+```
+As a routine check, we look at the histogram of p values for each comparison, expecting to see the usual distribution (flat with a peak close to 0):
+
+```{r, fig.height = 9, fig.width = 9}
+layout(matrix(1:4, nrow = 2))
+for(i in names(reslist_2))
+{
+	hist(reslist_2[[i]]$pvalue, breaks = 100, col = "cadetblue", border = NA, main = paste("p value distribution for", i))
+}
+```
+Distributions are as expected. We can now look at the differential expression profiles in volcano plots:
+
+```{r, fig.height = 9, fig.width = 9}
+plot_volcano(reslist_2[[1]], alpha = 0.05, lfc = 1, maxdot = 40, cextest = 0.7, main = "X203 vs IgG", grid = F)
+plot_volcano(reslist_2[[2]], alpha = 0.05, lfc = 1, maxdot = 40, cextest = 0.7, main = "IgG vs saline", grid = F)
+plot_volcano(reslist_2[[3]], alpha = 0.05, lfc = 1, maxdot = 40, cextest = 0.7, main = "X203 vs saline", grid = F)
+```
+
+# Gene Set Enrichment Analysis
+
+## Hallmark genesets
+
+We begin by doing a GSEA using the Hallmark gene set from MSigDB. The input for the enrichment will be the stat column of the DESeq2 results object. We use 10^5 iterations and run the enrichment in parallel.
+
+```{r, eval = TRUE}
+reslist_2_2 = list()
+for (i in names(reslist_2))
+{
+	reslist_2_2[[i]] = reslist_2[[i]]
+	reslist_2_2[[i]]$ensid = rownames(reslist_2_2[[i]])
+	reslist_2_2[[i]] <- inner_join(reslist_2_2[[i]], bm, by=c("ensid"="ensembl_gene_id"))
+}
+
+for (i in names(reslist_2))
+{
+	write.table(file = paste("DEseq_2_", i, ".txt", sep = ""), reslist_2[[i]], sep = "\t", quote = F)
+}
+reslist_2 = lapply(reslist_2, function(x) x = x[-which(is.na(x$padj)),])
+
+
+pathways = MSigDB$HALLMARK #select the Hallmark collection
+
+fgsea_hallmark_list_2 = list() #create empty list to store GSEA results
+
+for (i in 1:length(reslist_2))
+{
+res2 <- reslist_2_2[[i]] %>% 
+  dplyr::select(hsapiens_homolog_associated_gene_name, stat) %>% 
+  na.omit() %>% 
+  distinct() %>% 
+  group_by(hsapiens_homolog_associated_gene_name) %>% 
+  summarize(stat=mean(stat))
+ranks <- deframe(res2)
+
+fgsea_hallmark_list_2[[names(reslist_2_2)[i]]] <- fgsea(pathways=pathways, stats=ranks, nperm = 100000, BPPARAM = SnowParam()) #do the enrichment analysis
+fgsea_hallmark_list_2[[names(reslist_2_2[i])]] <- as.data.frame(fgsea_hallmark_list_2[[names(reslist_2_2[i])]][,c(1,3,5)])
+rownames(fgsea_hallmark_list_2[[names(reslist_2_2)[i]]]) = fgsea_hallmark_list_2[[names(reslist_2_2[i])]]$pathway
+fgsea_hallmark_list_2[[names(reslist_2_2[i])]]$pathway = NULL
+
+}
+
+
+hallmark_2_df = as.data.frame(do.call(cbind, fgsea_hallmark_list_2))
+
+hallmark_2_df_p = hallmark_2_df[,grep("padj", colnames(hallmark_2_df))]
+hallmark_2_df_n = hallmark_2_df[,grep("NES", colnames(hallmark_2_df))]
+```
+
+```{r, fig.height = nrow(hallmark_2_df_n)*0.5, fig.width = 12}
+par(mar = c(6, 1, 1, 20))
+bubbleMap(valuedf = hallmark_2_df_n, pvaluedf = hallmark_2_df_p, color_pal = viridis(25, option = "A"), maplabel = "NES", cex.binned = F)
+```
+
+Interestingly, we can detect the anti-inflammatory effect of the antibody by seeing how the inflammatory signatures are mostly down-regulated (significant, negative normalized enrichment score).
+
+
+## Gene Ontology genesets
+
+We then use the whole GO collection to perform a similar analysis. However, since showing all the results would be impossible, we pre-select some interesting signatures (ECM and inflammation) and then we show, unbiasedly, the top 20 most up- and down-regulated signatures in each comparison.
+
+
+```{r, eval = TRUE}
+pathways = MSigDB$C5_GENE_ONTOLOGY #select the Hallmark collection
+
+fgsea_2_go_list = list() #create empty list to store GSEA results
+
+for (i in 1:length(reslist_2_2))
+{
+res2 <- reslist_2_2[[i]] %>% 
+  dplyr::select(hsapiens_homolog_associated_gene_name, stat) %>% 
+  na.omit() %>% 
+  distinct() %>% 
+  group_by(hsapiens_homolog_associated_gene_name) %>% 
+  summarize(stat=mean(stat))
+ranks <- deframe(res2)
+
+fgsea_2_go_list[[names(reslist_2_2)[i]]] <- fgsea(pathways=pathways, stats=ranks, nperm = 100000, BPPARAM = SnowParam()) #do the enrichment analysis
+fgsea_2_go_list[[names(reslist_2_2[i])]] <- as.data.frame(fgsea_2_go_list[[names(reslist_2_2[i])]][,c(1,3,5)])
+rownames(fgsea_2_go_list[[names(reslist_2_2)[i]]]) = fgsea_2_go_list[[names(reslist_2_2[i])]]$pathway
+fgsea_2_go_list[[names(reslist_2_2[i])]]$pathway = NULL
+
+}
+
+common_gsea_2 = intersect(intersect(rownames(fgsea_2_go_list[[1]]), rownames(fgsea_2_go_list[[2]])), rownames(fgsea_2_go_list[[3]]))
+fgsea_2_go_list = lapply(fgsea_2_go_list, function(x) x[common_gsea_2,])
+go_df_2 = as.data.frame(do.call(cbind, fgsea_2_go_list))
+
+go_df_p_2 = go_df_2[,grep("padj", colnames(go_df_2))]
+go_df_n_2 = go_df_2[,grep("NES", colnames(go_df_2))]
+
+inflammation_rows_2 = grep("INFLAM", rownames(go_df_2))
+ecm_rows = grep("EXTRACELLULAR_MATRIX", rownames(go_df_2))
+```
+
+```{r, fig.width = 12, fig.height = length(c(ecm_rows,inflammation_rows_2))*0.5}
+par(mar = c(6, 1, 1, 20))
+
+bubbleMap(valuedf = go_df_n_2[c(ecm_rows,inflammation_rows_2),], pvaluedf = go_df_p_2[c(ecm_rows,inflammation_rows_2),], maplabel = "NES", color_pal = viridis(25, option = "A"), cex.binned = F)
+```
+
+Top 20 most up- and down-regulated lollipop plot in each comparison:
+
+```{r, fig.width = 12, fig.height = 12}
+tdf = as.data.frame(cbind(go_df_n_2[,1], go_df_p_2[,1]))
+rownames(tdf) = rownames(go_df_n_2)
+colnames(tdf) = c("NES", "padj")
+tdf$pathway = rownames(tdf)
+lollipop_GSEA(tdf, show.max = 20, main = "X203 vs IgG GSEA", xlim = c(-5, 5))
+
+
+tdf = as.data.frame(cbind(go_df_n_2[,2], go_df_p_2[,2]))
+rownames(tdf) = rownames(go_df_n_2)
+colnames(tdf) = c("NES", "padj")
+tdf$pathway = rownames(tdf)
+lollipop_GSEA(tdf, show.max = 20, main = "IgG vs Saline GSEA", xlim = c(-5, 5))
+
+
+tdf = as.data.frame(cbind(go_df_n_2[,3], go_df_p_2[,3]))
+rownames(tdf) = rownames(go_df_n_2)
+colnames(tdf) = c("NES", "padj")
+tdf$pathway = rownames(tdf)
+lollipop_GSEA(tdf, show.max = 20, main = "X203 vs Saline GSEA", xlim = c(-5, 5))
+```
+
+## Specific ECM regulation by X203
+
+We can show that both IgG and X203 target more ECM than inflammation by plotting the normalized enrichment score of X203 vs IgG against the score of IgG vs Saline. The fact that magenta dots are more to the upper left corner of the plot thatn the orange ones means that ECM is more affected than inflammation.
+
+```{r, fig.width = 8, fig.height = 8}
+plot( go_df_n_2[c(ecm_rows,inflammation_rows_2),1], go_df_n_2[c(ecm_rows,inflammation_rows_2),2], pch = 16, col = c(rep("darkmagenta", length(ecm_rows)), rep("orange", length(inflammation_rows_2))), ylim = c(-3,3), xlim = c(-3,3), xlab = "X203 vs IgG NES", ylab = "IgG vs Saline NES", main = "Enrichment score comparison")
+abline(h = 0) + abline(v = 0) + abline(0,1, lty = 2) + abline(0,-1, lty = 2)
+legend ("topright", bty = "n", pch = 16, col = c("darkmagenta", "orange"), legend = c("ECM", "Inflammation"))
+```
+
+As another confirmation, we can plot the distribution of log2FoldChanges in X203 and IgG of Gene Ontology ECM and inflammation genes (dots show significant genes):
+
+```{r, fig.width = 8, fig.height = 8}
+go_inf = MSigDB$C5_GENE_ONTOLOGY$GO_INFLAMMATORY_RESPONSE
+go_inf_mouse = bm[bm[,2] %in% go_inf,1]
+
+lfc_X203_IgG_inf = reslist_2$res_2_X203_IgG[go_inf_mouse,2]
+lfc_X203_IgG_inf_sig = reslist_2$res_2_X203_IgG[intersect(go_inf_mouse, rownames(reslist_2$res_2_X203_IgG[which(reslist_2$res_2_X203_IgG$padj < 0.05),])),2]
+
+go_ecm = MSigDB$C5_GENE_ONTOLOGY$GO_EXTRACELLULAR_MATRIX_COMPONENT
+go_ecm_mouse = bm[bm[,2] %in% go_ecm,1]
+
+lfc_X203_IgG_ecm = reslist_2$res_2_X203_IgG[go_ecm_mouse,2]
+lfc_X203_IgG_ecm_sig =  reslist_2$res_2_X203_IgG[intersect(go_ecm_mouse, rownames(reslist_2$res_2_X203_IgG[which(reslist_2$res_2_X203_IgG$padj < 0.05),])),2]
+
+
+boxplot(lfc_X203_IgG_ecm, lfc_X203_IgG_inf, ylab = "log2FoldChange", border = c("purple", "orange"), xaxt = "n", ylim =c(-2,2))
+axis(1, at = 1:2, labels = c("ECM", "INF"))
+beeswarm(lfc_X203_IgG_ecm_sig, at = 1, add = T, pch = 21, bg = "purple")
+beeswarm(lfc_X203_IgG_inf_sig, at = 2, add = T, pch = 21, bg = "orange")
+abline(h = 0, lty = 2)
+```
+
+And their volcano plots:
+
+```{r, fig.width = 10, fig.height = 7}
+layout(matrix(1:2, nrow = 1))
+plot_volcano(reslist_2$res_2_X203_IgG[go_ecm_mouse,], grid =F, cextest = 0.7, main = "ECM genes (X203 vs IgG)", xlim = c(-2,2))
+plot_volcano(reslist_2$res_2_X203_IgG[go_inf_mouse,], grid =F, cextest = 0.7, main = "Inflammation genes (X203 vs IgG)", xlim = c(-2,2))
+```
+
+Taken together, these results show that the effect on ECM is more prominent than that on inflammation, although the number of significant differentially expressed genes (at an FDR threshold of 0.05) is similar. The enrichment depends on the size of the respective categories. However, the distribution of all fold changes is more shifted to a negative median in ECM genes compared to inflammation genes.
+
+To better represent this result we isolate from the GSEA in X203 vs IgG the inflammation and ECM genesets and we show the lollipop plot:
+
+```{r, fig.width = 10, fig.height = 7}
+tdf = as.data.frame(cbind(go_df_n_2[,1], go_df_p_2[,1]))
+rownames(tdf) = rownames(go_df_n_2)
+colnames(tdf) = c("NES", "padj")
+tdf$pathway = rownames(tdf)
+tdf = tdf[c(inflammation_rows_2, ecm_rows),]
+par(mar = c(5,1,3,1))
+lollipop_GSEA(tdf, show.max = 28, main = "ECM and Inflammation X203 vs IgG GSEA", xlim = c(-5, 5))
+```
+We can see how the only significant inflammation categories have a lower enrichment than the significant ECM categories.
+
+
+# Session info
+
+```{r, sessioninfo}
+sessionInfo()
+```
+
+ <div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
+
+
+
