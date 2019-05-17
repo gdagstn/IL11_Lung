@@ -34,14 +34,14 @@ for f in data/LT*.txt; do
  done
 
 
-#for each chip used, create a target file.
+# for each chip used, create a target file.
  
  printf "FileName\tCondition\n" > data/scrubbed/Targets_45015.txt
  paste <(ls data/scrubbed/*.45015*) <(ls data/scrubbed/*.45015* | sed -E s#'^data/scrubbed/LT[A-Z0-9]+_'#''#g | sed s/.45015.txt//g) >> data/scrubbed/Targets_45015.txt
  printf "FileName\tCondition\n" > data/scrubbed/Targets_62976.txt
  paste <(ls data/scrubbed/*.62976*) <(ls data/scrubbed/*.62976* | sed -E s#'^data/scrubbed/LT[A-Z0-9]+_'#''#g | sed s/.62976.txt//g) >> data/scrubbed/Targets_62976.txt
 
-#make directories to save plots and tables
+# make directories to save plots and tables
 
  mkdir Lung_Function_Correlations
  	mkdir Lung_Function_Correlations/predicted_dlco
@@ -189,6 +189,7 @@ dothree = FALSE
 A linear model is fit, correcting for age and sex. Then the empirical Bayes shrinkage is applied. We then visualize the results for IL11.
 
 ```{r, limma_analysis}
+
 ## Limma analysis: set factors, levels and model matrix 
 d3.levels = unique(targets_2$Condition)
 d3.factor = factor(targets_2$Condition, levels=d3.levels)
@@ -199,8 +200,6 @@ d3.sex = factor(targets_2$Sex, levels = unique(targets_2$Sex))
 d3.sex = gsub(d3.sex, pattern = "1-Male", replacement = "Male")
 d3.sex = gsub(d3.sex, pattern = "2-Female", replacement = "Female")
 d3.sex = factor(d3.sex)
-
-
 
 d3.design = model.matrix(~ 0 + d3.factor + d3.age + d3.sex)
 
@@ -232,13 +231,13 @@ IL11 is significantly up-regulated in IPF lung tissue compared to healthy contro
 
 # Smoker status
 
-Smoker information is present only in a subset of samples. We subset the targets and run the same analysis:
+Smoker status information is present only in a subset of samples. We subset the targets and run the same analysis:
 
 ```{r}
-
+## Subset to have complete cases of smoker status
 targets_smoker <- targets_2[!is.na(targets_2$smoker),]
 
-
+## Limma analysis: set factors, levels and model matrix
 d4.levels = unique(targets_smoker$Condition)
 d4.factor = factor(targets_smoker$Condition, levels=d4.levels)
 d4.factor = relevel(d4.factor, "CTRL")
@@ -248,7 +247,6 @@ d4.sex = factor(targets_smoker$Sex, levels = unique(targets_smoker$Sex))
 d4.sex = gsub(d4.sex, pattern = "1-Male", replacement = "Male")
 d4.sex = gsub(d4.sex, pattern = "2-Female", replacement = "Female")
 d4.sex = factor(d4.sex)
-
 
 d4.smoker = as.character(factor(targets_smoker$smoker, levels = unique(targets_smoker$smoker)))
 d4.smoker = gsub(d4.smoker, pattern = "1-Current", replacement = "Current")
@@ -329,18 +327,20 @@ Let's see what these look like when incorporating smoker status:
 
 ```{r}
 layout(matrix(1:6, nrow = 2))
-for( i in colnames(targets_2)[13:17])
-{	
+for( i in colnames(targets_2)[13:17]){	
+
+	## Define target values: i is the lung function	
 	x_ipf = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "2-UIP/IPF", ]
 	x_ctrl = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "CTRL", ]
+	x_ipf[,i] <- as.numeric(x_ipf[,i])
+	x_ctrl[,i] <- as.numeric(x_ctrl[,i])
 
-	x_ipf[, i] <- as.numeric(x_ipf[, i])
-	x_ctrl[, i] <- as.numeric(x_ctrl[, i])
-
+	## Plot distributions of values as boxplots
 	boxplot(x_ipf[,i]~factor(x_ipf$smoker, levels = unique(x_ipf$smoker)), border = "salmon", lwd = 2, xaxt = "n", col = NA, main = paste(i, "IPF vs CTRL"), ylab = i, ylim = c(-5,max(c(x_ipf[,i], x_ctrl[,i])))+(max(c(x_ipf[,i], x_ctrl[,i]))/10), outline = F, at = 1:length(unique(x_ipf$smoker)), xlim = c(0,7))
 
 	boxplot(x_ctrl[,i] ~ factor(x_ctrl$smoker, levels = unique(x_ctrl$smoker)), border = "purple", lwd = 2, col = NA, outline = F, at = (length(unique(x_ipf$smoker)) + 1) : (length(unique(x_ipf$smoker)) + length(unique(x_ctrl$smoker))), add = T, xaxt = "n")
 	
+	## Overlay data points
 	beeswarm(x_ipf[,i] ~ factor(x_ipf$smoker, levels = unique(x_ipf$smoker)), method = "hex", pch = 21, cex = 0.7, col = 'black', bg = paste(col2hex('salmon'), '4D', sep = ""), at = 1:length(unique(x_ipf$smoker)), xlim = c(0,7), add = T)
 
 	beeswarm(x_ctrl[,i] ~ factor(x_ctrl$smoker, levels = unique(x_ctrl$smoker)), method = "hex", pch = 21, cex = 0.7, col = 'black', bg = paste(col2hex('purple'), '4D', sep = ""), add = T, at = (length(unique(x_ipf$smoker)) + 1):(length(unique(x_ipf$smoker))+length(unique(x_ctrl$smoker))))
@@ -358,15 +358,15 @@ We show the results of Wilcoxon rank sum tests between ever- and never-smokers w
 
 
 ```{r}
-for( i in colnames(targets)[13:17])
-{	
+for( i in colnames(targets)[13:17]){	
 
+	## Define target values: i is the lung function
 	x_ipf = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "2-UIP/IPF", ]
 	x_ctrl = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "CTRL", ]
 
-
+## Wilcoxon rank sum test
 print(paste(i, "Ever smoker - IPF vs CTRL:"))
-print(wilcox.test( as.numeric(x_ipf[x_ipf$smoker == "2-Ever (>100)",i]), as.numeric(x_ctrl[x_ctrl$smoker == "2-Ever (>100)",i]))$p.value)
+print(wilcox.test(as.numeric(x_ipf[x_ipf$smoker == "2-Ever (>100)",i]), as.numeric(x_ctrl[x_ctrl$smoker == "2-Ever (>100)",i]))$p.value)
 
 print(paste(i,"Never smoker - IPF vs CTRL:"))
 print(wilcox.test(as.numeric(x_ipf[x_ipf$smoker == "3-Never",i]), as.numeric(x_ctrl[x_ctrl$smoker == "3-Never",i]))$p.value)
@@ -378,12 +378,13 @@ All lung functions are significantly different between IPF and CTRL regardless o
 Now, within patient group and across smoker status:
 
 ```{r}
-for( i in colnames(targets)[13:17])
-{	
+for( i in colnames(targets)[13:17]){	
 
+	## Define target values: i is the lung function
 	x_ipf = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "2-UIP/IPF", ]
 	x_ctrl = targets_smoker[!is.na(targets_smoker[,i]) & targets_smoker$Ild.subtype == "CTRL", ]
 
+## Wilcoxon rank sum test
 print(paste(i, "IPF - Ever vs Never smoker"))
 print(wilcox.test( as.numeric(x_ipf[x_ipf$smoker == "2-Ever (>100)",i]), as.numeric(x_ipf[x_ipf$smoker == "3-Never",i]))$p.value)
 
@@ -572,13 +573,19 @@ layout(matrix(1:6, nrow = 2))
 targets_only_IPF = targets_2[targets_2$Condition == "ILD",]
 targets_only_IPF = targets_only_IPF[targets_only_IPF$Ild.subtype == "2-UIP/IPF",]
 
-for( i in colnames(targets)[13:17])
-{	
-			cor_targets = targets_only_IPF[which(!is.na(targets_only_IPF[,i])),]
-			Evalues = E3.avg$A[,cor_targets$FileName]
-			j = "NM_000641"
+for( i in colnames(targets)[13:17]){		
 
+			## Subset for samples with complete cases of each lung function i
+			cor_targets = targets_only_IPF[which(!is.na(targets_only_IPF[,i])),]
+
+			## Get the expression matrix for these samples
+			Evalues = E3.avg$A[,cor_targets$FileName]
+
+			## IL11 expression
+			j = "NM_000641"
 			expr_values = Evalues[j,]
+
+			## Lung function values
 			lungf_values = as.numeric(cor_targets[,i])
 
 			age = as.numeric(cor_targets$Age)[order(expr_values)]
@@ -591,21 +598,25 @@ for( i in colnames(targets)[13:17])
 			x <- expr_values
 			y <- lungf_values
 
-			#Fit first lm to adjust gene expression
+			## Fit first lm to adjust gene expression
 			fit1 <- lm(x ~ age + sex)
 			res1 = residuals(fit1)
+
+			## Adjusted IL11 expression: residuals + coefficient
 			adjx = res1 + fit1$coefficients[1]
 
-			#Fit lm with covariates
+			## Fit lm with covariates
 			fit2 <- lm(y ~ adjx)
 
 
-			#Extract residuals
+			## Extract residuals
 			res2 = residuals(fit2)
 
-
+			## Normality tests
 			at = nortest::ad.test(res2)
 			st = stats::shapiro.test(res2)
+
+			## QQ plot
 			qqnorm(res2, main = paste(i, "LM residuals"))
 			qqline(res2, col = 'red')
 			legend('topleft', bty = 'n', legend = c(paste("AD p:", formatC(at$p.value, format = "e", digits = 3)), paste("WS p:", formatC(st$p.value, format = "e", digits = 3))))
@@ -658,24 +669,34 @@ In order to find a correlation between lung function and gen expression we need 
 
 dofour = TRUE
 
+## Define targets: 4 IL-6 family cytokines
 cytokines = c('IL11','IL13','OSM','IL6')
 
+## Get the refseq ID for the transcripts that are present in this chip layout
 NM_in_chip_ck = intersect(bm[bm$hgnc_symbol %in% cytokines,2], rownames(E3.avg$A))
+
+## Small data frame containing refseq IDs, ensembl IDs and gene symbols
 ck_nm = bm[bm$refseq_mrna %in% NM_in_chip_ck,]
- 
+
 fibroid = cytokines
 fibroid_in_chip = intersect(bm[bm$hgnc_symbol %in% fibroid,2], rownames(E3.avg$A))
 fibroid_in_chip = bm[bm$refseq_mrna %in% fibroid_in_chip,]
+
+## Subset targets according to IPF classification
 targets_only_IPF = targets_2[targets_2$Condition == "ILD",]
 targets_only_IPF = targets_only_IPF[targets_only_IPF$Ild.subtype == "2-UIP/IPF",]
 
 cordata_ipf = list()
+
+## Long loop in which statistics will be evaluated, plots saved to PDF and a table with these statistics will be generated
+
 for( i in colnames(targets)[13:17])
 {	
 	cordata_ipf[[i]] = list()
 	cor_targets = targets_only_IPF[which(!is.na(targets_only_IPF[,i])),]
 	Evalues = E3.avg$A[,cor_targets$FileName]
 	resdf = matrix(ncol = 9)
+
 	for (j in fibroid_in_chip$refseq_mrna)
 		{
 
@@ -685,6 +706,7 @@ for( i in colnames(targets)[13:17])
 			cor_targets$col_ipf = cor_targets$Ild.subtype
 			cor_targets$col_ipf = gsub(cor_targets$col_ipf, pattern = "2-UIP/IPF", replacement = "#27AAE1")
 
+			## Covariates
 			age = as.numeric(cor_targets$Age)[order(expr_values)]
 			sex2 = cor_targets$Sex[order(expr_values)]
 			sex = factor(sex2, levels = c("1-Male", "2-Female"))
@@ -694,8 +716,10 @@ for( i in colnames(targets)[13:17])
 			sex2[sex2 == "1-Male"] = 0
 			sex2[sex2 == "2-Female"] = 1
 
+			## Save covariate values in a data frane for easier referencing
 			ddf = data.frame("expr" = as.numeric(expr_values), "func" = as.numeric(lungf_values), "age" = as.numeric(age), "sex" = as.numeric(sex2))
 
+			## First lm to generate adjusted gene expression values
 			x <- ddf$expr
 			y <- lungf_values
 
@@ -704,8 +728,10 @@ for( i in colnames(targets)[13:17])
 			adjx = res1 + fit1$coefficients[1]
 
 		
-			#Fit lm without covariates
+			## Fit lm with adjusted expression values
 			fit2 <- lm(y ~ adjx)
+
+			## Fit robust lm with adjusted expression values
 			fit3 <- robust::lmRob(y ~ adjx)
 
 			flmp = summary(fit2)$coefficients[2,4]
@@ -713,7 +739,8 @@ for( i in colnames(targets)[13:17])
 			rlmb = summary(fit3)$coefficients[2,1]
 
 			ddf2 = data.frame("epxr" = as.numeric(adjx), "func" = as.numeric(lungf_values))
-			
+
+			## Semipartial Spearman correlation test. Also gives confidence intervals. In this correlation test we use unadjusted values, because covariate values are accounted for in the semipartial correlation. 
 			spct = RVAideMemoire::pcor.test(x = ddf$func, y = ddf$expr, z = ddf[,3:4], method = 'spearman', semi = TRUE, conf.level = 0.95)
 			corrho = spct$estimate
 			corp = spct$p.value
@@ -725,12 +752,16 @@ for( i in colnames(targets)[13:17])
 				return(lm(d[,2]~d[,1], data = d)$coef)  
 			}
 
+			## To bootstrap the linear model coefficients we use the adjusted values, as done before
 			bootst_coefs = boot::boot(data = ddf2, statistic=lmboot, R=5000)
 			boot_ci = car::Confint(bootst_coefs, level = 0.95)
 
+			## Collate results together
 			allres = c(flmp, flmb, corrho, corp, corconf[1], corconf[2], rlmb, boot_ci[2,1], boot_ci[2,2])
 			resdf = rbind(resdf, allres)
 			colnames(resdf) = c("Full_lm_pval", "Full_lm_beta1", "Spearman_semipartial_rho", "Spearman_semipartial_pval", "Spearman_95CI_Inf", "Spearman_95CI_Sup","Robust_lm_beta", "Beta_95CI_Inf", "Beta_95CI_Sup")
+
+			## Make and save plots
 			pdf(file = paste("./Lung_Function_Correlations/",i, "/", fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3],"_vs_", i, "_IPFonly.pdf",sep=""), useDingbats = F, width = 7, height = 7)
 			plot(adjx, y, pch = 16, cex = 0.7, xlab = paste('Age- and sex- adjusted log2(', fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3], ')', sep = ""), col = cols , ylab = i, main = paste(fibroid_in_chip[fibroid_in_chip$refseq_mrna == j,3]," and ", i, sep=""), las = 1)
 			abline(fit2$coefficients[1:2], col='red')
@@ -738,13 +769,14 @@ for( i in colnames(targets)[13:17])
 			dev.off()
 
 		}
+
+		## Write table with the results
 		cordata_ipf[[i]] = as.data.frame(resdf[2:nrow(resdf),])
 		rownames(cordata_ipf[[i]]) = fibroid_in_chip$refseq_mrna
 		cordata_ipf[[i]]$gene = fibroid_in_chip$hgnc_symbol
 		write.table(file = paste("./Lung_Function_Correlations/", i, "/", i, "_IPF_LungFunction_correlations_table.txt",sep = ""), cordata_ipf[[i]], quote = F, sep = "\t")
 
 		dofour = FALSE
-
 }
 
 ```
@@ -764,7 +796,7 @@ bubbleMap(cordf_ipf, padjdf_ipf, color_pal = viridis(25, option = "C"), main = "
 ```
 <br>
 
-*IL11* is the most negatively correlated with DL<sub>CO</sub> % predicted, which is the most important index for IPF severity. A low DLCO means high disease severity, so a high negative correlation means that there is an inverse relationship with lung function and *IL11* expression. Other lung function measurements are correlated, but we must remember that the difference in FEV1 is not statistically significant between healthy individuals and IPF patients. 
+*IL11* is the most negatively correlated with DL<sub>CO</sub> % predicted, which is the most important index for IPF severity. A low DLCO means high disease severity, so a high negative correlation means that there is an inverse relationship with lung function and *IL11* expression.
 
 ## Correlation with lung function - CTRL
 
@@ -961,6 +993,7 @@ for(j in mkrs_nm_fib$refseq_mrna)
 ```
 
 The bubblemap reveals that IL11 is the only gene correlating with other fibrosis markers in IPF:
+
 ```{r, bubblemap_fibrosis_IPF, fig.height = 10, fig.width = 8}
 alldf_fib_ipf = as.data.frame(do.call(cbind, (do.call(cbind, corlist_ck_IPFonly))), stringsAsFactors = F)
 rownames(alldf_fib_ipf) = ck_nm$hgnc_symbol
